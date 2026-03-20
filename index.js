@@ -20,17 +20,14 @@ const upload = multer({
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser', version: '3.0.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser', version: '4.0.0' }));
 
 app.post('/parse', upload.single('demo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier reçu.' });
   const demoPath   = req.file.path;
   const playerName = req.body.player || null;
   console.log(`Parsing: ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(1)} MB)`);
-
-  // Timeout de 5 minutes
   res.setTimeout(300000);
-
   try {
     const result = await parseDemo(demoPath, playerName);
     res.json({ success: true, data: result });
@@ -85,7 +82,6 @@ function parseDemo(demoPath, targetPlayer) {
       } catch(e) {}
     });
 
-    // Positions toutes les 256 ticks pour économiser la mémoire
     demoFile.on('tickend', tick => {
       tickCount++;
       if (tickCount % 256 !== 0) return;
@@ -93,7 +89,6 @@ function parseDemo(demoPath, targetPlayer) {
         demoFile.entities.players.forEach(p => {
           if (!p.isAlive || !p.position) return;
           if (!positions[p.name]) positions[p.name] = [];
-          // Limite 300 points par joueur
           if (positions[p.name].length >= 300) return;
           positions[p.name].push({ tick, x: Math.round(p.position.x), y: Math.round(p.position.y), z: Math.round(p.position.z), team: p.teamNumber });
         });
@@ -120,50 +115,46 @@ function parseDemo(demoPath, targetPlayer) {
         kd:    p.deaths > 0 ? (p.kills/p.deaths).toFixed(2) : String(p.kills),
         hsPct: p.kills  > 0 ? ((p.hs/p.kills)*100).toFixed(1) : '0',
       })).sort((a,b) => b.kills - a.kills);
-
       resolve({
         meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: Object.keys(players), parsedAt: new Date().toISOString(), targetPlayer },
-        kills:       fKills.slice(0, 2000),
-        positions:   fPos,
-        grenades:    fGren,
-        rounds,
-        playerStats: stats,
-        duelZones:   computeDuelZones(kills, mapName),
+        kills: fKills.slice(0, 2000), positions: fPos, grenades: fGren, rounds,
+        playerStats: stats, duelZones: computeDuelZones(kills, mapName),
       });
     });
 
-    demoFile.on('error', err => {
-      console.error('DemoFile error:', err.message);
-      reject(err);
-    });
+    demoFile.on('error', err => { console.error('DemoFile error:', err.message); reject(err); });
 
-    // Lecture en stream
-    const stream = fs.createReadStream(demoPath);
-    stream.on('error', reject);
-    stream.pipe(demoFile);
+    try {
+      console.log('Reading file...');
+      const buffer = fs.readFileSync(demoPath);
+      console.log(`File read: ${(buffer.length/1024/1024).toFixed(1)} MB, parsing...`);
+      demoFile.parse(buffer);
+    } catch(err) {
+      reject(err);
+    }
   });
 }
 
 function computeDuelZones(kills, mapName) {
-  const B = { 'de_dust2':{minX:-2476,maxX:1444,minY:-1228,maxY:3346},'de_mirage':{minX:-3230,maxX:870,minY:-2750,maxY:930},'de_inferno':{minX:-2087,maxX:2870,minY:-1200,maxY:3110},'de_nuke':{minX:-3453,maxX:2497,minY:-3000,maxY:2200},'de_ancient':{minX:-2953,maxX:2164,minY:-1600,maxY:3200},'de_anubis':{minX:-2100,maxX:2500,minY:-2000,maxY:2700} };
-  const b = B[mapName] || { minX:-3000, maxX:3000, minY:-3000, maxY:3000 };
+  const B = {'de_dust2':{minX:-2476,maxX:1444,minY:-1228,maxY:3346},'de_mirage':{minX:-3230,maxX:870,minY:-2750,maxY:930},'de_inferno':{minX:-2087,maxX:2870,minY:-1200,maxY:3110},'de_nuke':{minX:-3453,maxX:2497,minY:-3000,maxY:2200},'de_ancient':{minX:-2953,maxX:2164,minY:-1600,maxY:3200},'de_anubis':{minX:-2100,maxX:2500,minY:-2000,maxY:2700}};
+  const b = B[mapName] || {minX:-3000,maxX:3000,minY:-3000,maxY:3000};
   const G = 10, zones = {};
   const c = v => Math.max(0, Math.min(G-1, v));
   kills.forEach(k => {
     const col = c(Math.floor(((k.attackerX-b.minX)/(b.maxX-b.minX))*G));
     const row = c(Math.floor(((k.attackerY-b.minY)/(b.maxY-b.minY))*G));
     const key = `${col}_${row}`;
-    if (!zones[key]) zones[key] = { kills:0, deaths:0, col, row };
+    if (!zones[key]) zones[key] = {kills:0,deaths:0,col,row};
     zones[key].kills++;
   });
   kills.forEach(k => {
     const col = c(Math.floor(((k.victimX-b.minX)/(b.maxX-b.minX))*G));
     const row = c(Math.floor(((k.victimY-b.minY)/(b.maxY-b.minY))*G));
     const key = `${col}_${row}`;
-    if (!zones[key]) zones[key] = { kills:0, deaths:0, col, row };
+    if (!zones[key]) zones[key] = {kills:0,deaths:0,col,row};
     zones[key].deaths++;
   });
-  return Object.entries(zones).map(([key,z]) => ({ key, col:z.col, row:z.row, kills:z.kills, deaths:z.deaths, winRate: z.kills+z.deaths>0 ? ((z.kills/(z.kills+z.deaths))*100).toFixed(0) : '50' }));
+  return Object.entries(zones).map(([key,z]) => ({key,col:z.col,row:z.row,kills:z.kills,deaths:z.deaths,winRate:z.kills+z.deaths>0?((z.kills/(z.kills+z.deaths))*100).toFixed(0):'50'}));
 }
 
 app.listen(PORT, () => console.log(`FragValue Demo Parser on port ${PORT}`));
