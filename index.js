@@ -8,7 +8,7 @@ const { DemoFile, parseEvent } = require('demofile');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: ['https://frag-value.vercel.app', 'http://localhost:3000', 'http://localhost:5500'] }));
+app.use(cors({ origin: ['*'] }));
 app.use(express.json());
 
 const upload = multer({
