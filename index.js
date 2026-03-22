@@ -109,12 +109,20 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   // ── 5. Positions (ticks samplés) ──────────────────────────────────────────
   let positions = {};
   try {
-    const tickData = parseTicks(demoPath, ['X', 'Y', 'Z', 'team_num', 'name'], { every_nth_tick: 512 });
+    // Signature correcte : parseTicks(path, [props]) — PAS de 3ème argument
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'Z', 'team_num', 'steamid']);
+    // Map steamid → nickname depuis playerInfoRaw
+    const steamToName = {};
+    playerInfoRaw.forEach(p => { if (p.steamid && p.name) steamToName[p.steamid] = p.name; });
     tickData.forEach(t => {
-      if (!t.name || t.X == null) return;
-      if (!positions[t.name]) positions[t.name] = [];
-      positions[t.name].push({ tick: t.tick, x: t.X, y: t.Y, z: t.Z, team: t.team_num });
+      if (t.X == null) return;
+      const name = steamToName[t.steamid] || t.steamid;
+      if (!name) return;
+      if (!positions[name]) positions[name] = [];
+      positions[name].push({ tick: t.tick, x: t.X, y: t.Y, z: t.Z, team: t.team_num });
     });
+    const fp = Object.keys(positions)[0];
+    if (fp) console.log(`Positions sample — ${fp}: ${positions[fp].length} ticks`);
   } catch(e) {
     console.warn('Positions warning:', e.message);
   }
