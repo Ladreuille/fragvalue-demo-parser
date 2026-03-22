@@ -4,6 +4,7 @@ const cors    = require('cors');
 const fs      = require('fs');
 const os      = require('os');
 const path    = require('path');
+const { parseEvent, parsePlayerInfo, parseTicks } = require('@laihoe/demoparser2');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -20,19 +21,19 @@ const upload = multer({
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '5.0.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.0.0' }));
 
 app.post('/parse', upload.single('demo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier reçu.' });
 
   const demoPath   = req.file.path;
-  const playerName = req.body.player || null;
+  const targetPlayer = req.body.player || null;
   console.log(`Parsing CS2 demo: ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(1)} MB)`);
 
   res.setTimeout(300000);
 
   try {
-    const result = await parseCS2Demo(demoPath, playerName);
+    const result = await parseCS2Demo(demoPath, targetPlayer);
     res.json({ success: true, data: result });
   } catch (err) {
     console.error('Parse error:', err.message);
@@ -42,154 +43,147 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
   }
 });
 
+// ─── PARSER PRINCIPAL ─────────────────────────────────────────────────────────
 async function parseCS2Demo(demoPath, targetPlayer) {
-  // CS2 demos use Source 2 format — parse binary manually
-  const buffer = fs.readFileSync(demoPath);
-  console.log(`File read: ${(buffer.length/1024/1024).toFixed(1)} MB`);
 
-  // Verify CS2 demo header "PBDEMS2"
-  const header = buffer.slice(0, 8).toString('ascii');
-  console.log(`Header: ${header}`);
+  // ── 1. Infos joueurs (vrais pseudos + steamid) ────────────────────────────
+  const playerInfoRaw = parsePlayerInfo(demoPath);
+  // playerInfoRaw = [{ name, steamid, team_number, ... }]
+  const playerInfoMap = {}; // steamid → name
+  playerInfoRaw.forEach(p => { if (p.steamid) playerInfoMap[p.steamid] = p.name; });
+  const playerNames = [...new Set(playerInfoRaw.map(p => p.name).filter(Boolean))];
+  console.log(`Players found: ${playerNames.join(', ')}`);
 
-  if (!header.startsWith('PBDEMS2') && !header.startsWith('HL2DEMO')) {
-    throw new Error(`Format non reconnu: ${header}. Assurez-vous que le fichier est bien un .dem CS2.`);
-  }
+  // ── 2. Kills ──────────────────────────────────────────────────────────────
+  const killEvents = parseEvent(demoPath, 'player_death', [
+    'attacker_name', 'attacker_team_num', 'attacker_X', 'attacker_Y', 'attacker_Z',
+    'user_name',     'user_team_num',     'user_X',     'user_Y',     'user_Z',
+    'weapon', 'headshot', 'thrusmoke', 'penetrated',
+  ]);
 
-  // Pour CS2 (PBDEMS2), on extrait les données disponibles dans les métadonnées
-  // Le parsing complet nécessite protobuf — on retourne les données de base
-  const meta = extractCS2Meta(buffer, demoPath);
+  const kills = killEvents.map(e => ({
+    round:        e.round ?? 0,
+    attacker:     e.attacker_name  || 'Unknown',
+    attackerTeam: e.attacker_team_num ?? 0,
+    attackerX:    e.attacker_X    ?? 0,
+    attackerY:    e.attacker_Y    ?? 0,
+    attackerZ:    e.attacker_Z    ?? 0,
+    victim:       e.user_name     || 'Unknown',
+    victimTeam:   e.user_team_num ?? 0,
+    victimX:      e.user_X        ?? 0,
+    victimY:      e.user_Y        ?? 0,
+    victimZ:      e.user_Z        ?? 0,
+    weapon:       e.weapon        || '',
+    isHeadshot:   !!e.headshot,
+    thruSmoke:    !!e.thrusmoke,
+    isWallbang:   (e.penetrated ?? 0) > 0,
+  })).filter(k => k.attacker !== 'Unknown' && k.victim !== 'Unknown');
 
-  // Générer des données de démonstration réalistes basées sur la taille du fichier
-  // (parsing complet CS2 nécessite un binaire natif)
-  const demoData = generateDemoData(meta, targetPlayer);
+  console.log(`Kills parsed: ${kills.length}`);
 
-  return demoData;
-}
-
-function extractCS2Meta(buffer, demoPath) {
-  const header = buffer.slice(0, 8).toString('ascii').trim();
-  const fileSize = buffer.length;
-
-  // Estimation du nombre de rounds basée sur la taille
-  const estimatedRounds = Math.min(30, Math.floor(fileSize / (15 * 1024 * 1024)));
-
-  // Cherche le nom de la map dans le buffer (string ASCII)
+  // ── 3. Map name ───────────────────────────────────────────────────────────
+  const roundStartEvents = parseEvent(demoPath, 'round_start', []);
   let mapName = 'de_dust2';
-  const maps = ['de_dust2', 'de_mirage', 'de_inferno', 'de_nuke', 'de_ancient', 'de_anubis', 'de_vertigo', 'de_overpass'];
-  const bufStr = buffer.slice(0, 2000).toString('ascii', 0, 2000);
-  for (const map of maps) {
-    if (bufStr.includes(map)) { mapName = map; break; }
-  }
-
-  console.log(`Detected map: ${mapName}, estimated rounds: ${estimatedRounds}`);
-  return { header, mapName, estimatedRounds, fileSize };
-}
-
-function generateDemoData(meta, targetPlayer) {
-  const { mapName, estimatedRounds } = meta;
-  const MAP_BOUNDS = {
-    'de_dust2':   {minX:-2476,maxX:1444,minY:-1228,maxY:3346},
-    'de_mirage':  {minX:-3230,maxX:870, minY:-2750,maxY:930},
-    'de_inferno': {minX:-2087,maxX:2870,minY:-1200,maxY:3110},
-    'de_nuke':    {minX:-3453,maxX:2497,minY:-3000,maxY:2200},
-    'de_ancient': {minX:-2953,maxX:2164,minY:-1600,maxY:3200},
-    'de_anubis':  {minX:-2100,maxX:2500,minY:-2000,maxY:2700},
-    'de_vertigo': {minX:-3168,maxX:1886,minY:-3316,maxY:1740},
-  };
-  const bounds = MAP_BOUNDS[mapName] || MAP_BOUNDS['de_dust2'];
-
-  const playerNames = targetPlayer
-    ? [targetPlayer, 'Player2', 'Player3', 'Player4', 'Player5', 'Player6', 'Player7', 'Player8', 'Player9', 'Player10']
-    : ['Player1','Player2','Player3','Player4','Player5','Player6','Player7','Player8','Player9','Player10'];
-
-  const rand = (min, max) => Math.round(min + Math.random() * (max - min));
-  const randF = (min, max) => min + Math.random() * (max - min);
-
-  // Génère des kills réalistes
-  const kills = [];
-  const totalKills = estimatedRounds * 8;
-  for (let i = 0; i < totalKills; i++) {
-    const atk = playerNames[rand(0, 4)];
-    const vic = playerNames[rand(5, 9)];
-    kills.push({
-      round: rand(1, estimatedRounds),
-      attacker: atk, attackerTeam: 2,
-      attackerX: rand(bounds.minX, bounds.maxX),
-      attackerY: rand(bounds.minY, bounds.maxY),
-      attackerZ: rand(0, 200),
-      victim: vic, victimTeam: 3,
-      victimX: rand(bounds.minX, bounds.maxX),
-      victimY: rand(bounds.minY, bounds.maxY),
-      victimZ: rand(0, 200),
-      weapon: ['ak47','m4a1','awp','deagle','usp_silencer'][rand(0,4)],
-      isHeadshot: Math.random() > 0.6,
-      thruSmoke: Math.random() > 0.9,
-      isWallbang: Math.random() > 0.92,
-    });
-  }
-
-  // Positions
-  const positions = {};
-  playerNames.forEach(name => {
-    positions[name] = [];
-    for (let i = 0; i < 200; i++) {
-      positions[name].push({
-        tick: i * 256,
-        x: rand(bounds.minX, bounds.maxX),
-        y: rand(bounds.minY, bounds.maxY),
-        z: rand(0, 100),
-        team: playerNames.indexOf(name) < 5 ? 2 : 3,
-      });
+  try {
+    // map_name est dans les infos header — chercher via round_announce ou server_info
+    const serverInfo = parseEvent(demoPath, 'server_info', ['map_name']);
+    if (serverInfo.length > 0 && serverInfo[0].map_name) {
+      mapName = serverInfo[0].map_name;
     }
+  } catch(e) {
+    // Fallback : chercher dans le nom du fichier ou laisser dust2
+    const known = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass'];
+    for (const m of known) { if (demoPath.includes(m)) { mapName = m; break; } }
+  }
+  console.log(`Map: ${mapName}`);
+
+  // ── 4. Rounds ─────────────────────────────────────────────────────────────
+  const roundEndEvents = parseEvent(demoPath, 'round_end', ['winner', 'reason']);
+  const rounds = roundEndEvents.map((e, i) => ({
+    round:  i + 1,
+    winner: e.winner ?? 0,
+    reason: e.reason ?? 0,
+  }));
+  const totalRounds = rounds.length || 1;
+  console.log(`Rounds: ${totalRounds}`);
+
+  // ── 5. Positions (ticks) ──────────────────────────────────────────────────
+  // On sample 1 tick toutes les 256 ticks pour ne pas exploser la mémoire
+  let positions = {};
+  try {
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'Z', 'name', 'team_num'], { every_nth_tick: 256 });
+    tickData.forEach(t => {
+      if (!t.name || t.X == null) return;
+      if (!positions[t.name]) positions[t.name] = [];
+      positions[t.name].push({ tick: t.tick, x: t.X, y: t.Y, z: t.Z, team: t.team_num });
+    });
+  } catch(e) {
+    console.warn('Positions parse warning:', e.message);
+    // positions reste vide — pas bloquant
+  }
+  console.log(`Positions for ${Object.keys(positions).length} players`);
+
+  // ── 6. Grenades ───────────────────────────────────────────────────────────
+  let grenades = [];
+  try {
+    const grenadeEvents = parseEvent(demoPath, 'weapon_fire', [
+      'user_name', 'user_team_num', 'user_X', 'user_Y', 'user_Z', 'weapon'
+    ]);
+    const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade']);
+    grenades = grenadeEvents
+      .filter(e => grenadeTypes.has(e.weapon))
+      .map(e => ({
+        round:   e.round ?? 0,
+        type:    e.weapon,
+        thrower: e.user_name || 'Unknown',
+        team:    e.user_team_num ?? 0,
+        startX:  e.user_X ?? 0,
+        startY:  e.user_Y ?? 0,
+        startZ:  e.user_Z ?? 0,
+      }));
+  } catch(e) {
+    console.warn('Grenades parse warning:', e.message);
+  }
+  console.log(`Grenades: ${grenades.length}`);
+
+  // ── 7. Player stats ───────────────────────────────────────────────────────
+  const statsMap = {};
+  kills.forEach(k => {
+    if (!statsMap[k.attacker]) statsMap[k.attacker] = { name: k.attacker, kills: 0, deaths: 0, hs: 0 };
+    if (!statsMap[k.victim])   statsMap[k.victim]   = { name: k.victim,   kills: 0, deaths: 0, hs: 0 };
+    statsMap[k.attacker].kills++;
+    statsMap[k.victim].deaths++;
+    if (k.isHeadshot) statsMap[k.attacker].hs++;
   });
 
-  // Grenades
-  const grenades = [];
-  const grenadeTypes = ['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov'];
-  for (let i = 0; i < estimatedRounds * 3; i++) {
-    grenades.push({
-      round: rand(1, estimatedRounds),
-      type: grenadeTypes[rand(0, 3)],
-      thrower: playerNames[rand(0, 9)],
-      team: rand(2, 3),
-      startX: rand(bounds.minX, bounds.maxX),
-      startY: rand(bounds.minY, bounds.maxY),
-      startZ: rand(0, 150),
-    });
-  }
+  const playerStats = Object.values(statsMap).map(p => ({
+    name:   p.name,
+    kills:  p.kills,
+    deaths: p.deaths,
+    hs:     p.hs,
+    kd:     p.deaths > 0 ? (p.kills / p.deaths).toFixed(2) : p.kills.toFixed(2),
+    hsPct:  p.kills > 0  ? ((p.hs / p.kills) * 100).toFixed(1) : '0.0',
+  })).sort((a, b) => b.kills - a.kills);
 
-  // Rounds
-  const rounds = [];
-  for (let i = 1; i <= estimatedRounds; i++) {
-    rounds.push({ round: i, winner: Math.random() > 0.5 ? 2 : 3 });
-  }
-
-  // Player stats
-  const playerStats = playerNames.map((name, idx) => {
-    const k = rand(5, 25);
-    const d = rand(5, 20);
-    const hs = rand(0, k);
-    return {
-      name, kills: k, deaths: d, hs,
-      kd: (k/d).toFixed(2),
-      hsPct: ((hs/k)*100).toFixed(1),
-    };
-  }).sort((a,b) => b.kills - a.kills);
-
-  // Duel zones
+  // ── 8. Duel zones ─────────────────────────────────────────────────────────
   const duelZones = computeDuelZones(kills, mapName);
+
+  // ── 9. targetPlayer ───────────────────────────────────────────────────────
+  // Si le nom passé est un pseudo exact → ok, sinon prendre le 1er joueur
+  const resolvedTarget = targetPlayer && playerNames.includes(targetPlayer)
+    ? targetPlayer
+    : playerStats[0]?.name || null;
 
   return {
     meta: {
-      map: mapName,
-      rounds: estimatedRounds,
-      totalKills: kills.length,
-      players: playerNames,
-      parsedAt: new Date().toISOString(),
-      targetPlayer,
-      note: 'CS2 demo parsed - full protobuf parsing coming soon'
+      map:         mapName,
+      rounds:      totalRounds,
+      totalKills:  kills.length,
+      players:     playerNames,
+      parsedAt:    new Date().toISOString(),
+      targetPlayer: resolvedTarget,
     },
-    kills: kills.slice(0, 2000),
+    kills:       kills.slice(0, 5000),
     positions,
     grenades,
     rounds,
@@ -198,26 +192,41 @@ function generateDemoData(meta, targetPlayer) {
   };
 }
 
+// ─── DUEL ZONES ───────────────────────────────────────────────────────────────
 function computeDuelZones(kills, mapName) {
-  const B = {'de_dust2':{minX:-2476,maxX:1444,minY:-1228,maxY:3346},'de_mirage':{minX:-3230,maxX:870,minY:-2750,maxY:930},'de_inferno':{minX:-2087,maxX:2870,minY:-1200,maxY:3110},'de_nuke':{minX:-3453,maxX:2497,minY:-3000,maxY:2200},'de_ancient':{minX:-2953,maxX:2164,minY:-1600,maxY:3200},'de_anubis':{minX:-2100,maxX:2500,minY:-2000,maxY:2700}};
-  const b = B[mapName] || {minX:-3000,maxX:3000,minY:-3000,maxY:3000};
+  const BOUNDS = {
+    'de_dust2':   {minX:-2476,maxX:1444,minY:-1228,maxY:3346},
+    'de_mirage':  {minX:-3230,maxX:870, minY:-2750,maxY:930},
+    'de_inferno': {minX:-2087,maxX:2870,minY:-1200,maxY:3110},
+    'de_nuke':    {minX:-3453,maxX:2497,minY:-3000,maxY:2200},
+    'de_ancient': {minX:-2953,maxX:2164,minY:-1600,maxY:3200},
+    'de_anubis':  {minX:-2796,maxX:2500,minY:-2000,maxY:3328},
+    'de_overpass':{minX:-4831,maxX:1781,minY:-1600,maxY:3200},
+  };
+  const b = BOUNDS[mapName] || {minX:-3000,maxX:3000,minY:-3000,maxY:3000};
   const G = 10, zones = {};
-  const c = v => Math.max(0, Math.min(G-1, v));
+  const clamp = v => Math.max(0, Math.min(G-1, v));
+
   kills.forEach(k => {
-    const col = c(Math.floor(((k.attackerX-b.minX)/(b.maxX-b.minX))*G));
-    const row = c(Math.floor(((k.attackerY-b.minY)/(b.maxY-b.minY))*G));
+    const col = clamp(Math.floor(((k.attackerX-b.minX)/(b.maxX-b.minX))*G));
+    const row = clamp(Math.floor(((k.attackerY-b.minY)/(b.maxY-b.minY))*G));
     const key = `${col}_${row}`;
     if (!zones[key]) zones[key] = {kills:0,deaths:0,col,row};
     zones[key].kills++;
   });
   kills.forEach(k => {
-    const col = c(Math.floor(((k.victimX-b.minX)/(b.maxX-b.minX))*G));
-    const row = c(Math.floor(((k.victimY-b.minY)/(b.maxY-b.minY))*G));
+    const col = clamp(Math.floor(((k.victimX-b.minX)/(b.maxX-b.minX))*G));
+    const row = clamp(Math.floor(((k.victimY-b.minY)/(b.maxY-b.minY))*G));
     const key = `${col}_${row}`;
     if (!zones[key]) zones[key] = {kills:0,deaths:0,col,row};
     zones[key].deaths++;
   });
-  return Object.entries(zones).map(([key,z]) => ({key,col:z.col,row:z.row,kills:z.kills,deaths:z.deaths,winRate:z.kills+z.deaths>0?((z.kills/(z.kills+z.deaths))*100).toFixed(0):'50'}));
+
+  return Object.entries(zones).map(([key, z]) => ({
+    key, col: z.col, row: z.row,
+    kills: z.kills, deaths: z.deaths,
+    winRate: z.kills+z.deaths > 0 ? ((z.kills/(z.kills+z.deaths))*100).toFixed(0) : '50',
+  }));
 }
 
-app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 on port ${PORT}`));
+app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 v6.0 on port ${PORT}`));
