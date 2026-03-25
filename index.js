@@ -3,7 +3,7 @@ const multer  = require('multer');
 const cors    = require('cors');
 const fs      = require('fs');
 const os      = require('os');
-const { parseEvent, parsePlayerInfo, parseTicks } = require('@laihoe/demoparser2');
+const { parseEvent, parsePlayerInfo } = require('@laihoe/demoparser2');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -117,84 +117,49 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   const totalRounds = rounds.length || 1;
   console.log(`Rounds: ${totalRounds}`);
 
-  // ── 5. Positions via parseTicks avec sample manuel ─────────────────────────
-  // Stratégie : on essaie parseTicks, si ca crash on reconstruit depuis les kills
+  // ── 5. Positions via player_hurt (léger et fiable) ──────────────────────────
+  // parseTicks charge trop de mémoire sur les grosses démos → OOM
+  // player_hurt donne des positions précises à chaque échange de dégâts
   let positions = {};
-
   try {
-    console.log('Trying parseTicks...');
-    const tickData = parseTicks(demoPath, ['X', 'Y', 'Z', 'team_num', 'steamid']);
-
-    // Vérifier que tickData est bien itérable
-    if (!tickData || typeof tickData[Symbol.iterator] !== 'function') {
-      throw new Error('parseTicks did not return iterable');
-    }
-
-    let i = 0;
-    const SAMPLE = 128; // 1 tick sur 128 pour éviter surcharge mémoire
-    for (const t of tickData) {
-      i++;
-      if (i % SAMPLE !== 0) continue;
-      if (t.X == null) continue;
-      const name = steamToName[String(t.steamid)] || String(t.steamid);
-      if (!name) continue;
-      if (!positions[name]) positions[name] = [];
-      // Limiter à 500 points par joueur max
-      if (positions[name].length >= 500) continue;
-      positions[name].push({ x: t.X, y: t.Y, z: t.Z, team: t.team_num });
-    }
-
-    const fp = Object.keys(positions)[0];
-    if (fp) {
-      console.log(`parseTicks OK — ${fp}: ${positions[fp].length} points`);
-    } else {
-      throw new Error('parseTicks returned no usable positions');
-    }
-
-  } catch(e) {
-    console.warn('parseTicks failed:', e.message);
-    console.log('Fallback: reconstructing positions from kills + hurt events...');
-
-    // FALLBACK : reconstruire les positions depuis player_hurt + kills
-    // player_hurt donne des positions fréquentes et fiables
-    try {
-      const hurtEvents = parseEvent(
-        demoPath, 'player_hurt',
-        ['X', 'Y', 'Z', 'team_num'],
-        ['total_rounds_played']
-      );
-
-      hurtEvents.forEach(e => {
-        // Attacker position
-        const attName = e.attacker_name || e.attacker;
-        if (attName && attName !== 'Unknown' && e.attacker_X != null) {
-          if (!positions[attName]) positions[attName] = [];
-          if (positions[attName].length < 400) {
-            positions[attName].push({ x: e.attacker_X, y: e.attacker_Y, z: e.attacker_Z, team: e.attacker_team_num ?? 0 });
-          }
-        }
-        // Victim position
-        const vicName = e.user_name || e.user;
-        if (vicName && vicName !== 'Unknown' && e.user_X != null) {
-          if (!positions[vicName]) positions[vicName] = [];
-          if (positions[vicName].length < 400) {
-            positions[vicName].push({ x: e.user_X, y: e.user_Y, z: e.user_Z, team: e.user_team_num ?? 0 });
-          }
-        }
-      });
-      console.log(`Fallback positions from player_hurt: ${Object.keys(positions).length} players`);
-    } catch(e2) {
-      console.warn('player_hurt fallback failed:', e2.message);
-
-      // FALLBACK 2 : utiliser uniquement les positions de kills (moins dense mais fiable)
-      kills.forEach(k => {
-        if (!positions[k.attacker]) positions[k.attacker] = [];
+    const hurtEvents = parseEvent(
+      demoPath, 'player_hurt',
+      ['X', 'Y', 'Z', 'team_num'],
+      ['total_rounds_played']
+    );
+    hurtEvents.forEach(e => {
+      const attName = e.attacker_name || e.attacker;
+      if (attName && attName !== 'Unknown' && e.attacker_X != null) {
+        if (!positions[attName]) positions[attName] = [];
+        if (positions[attName].length < 600)
+          positions[attName].push({ x: e.attacker_X, y: e.attacker_Y, z: e.attacker_Z, team: e.attacker_team_num ?? 0 });
+      }
+      const vicName = e.user_name || e.user;
+      if (vicName && vicName !== 'Unknown' && e.user_X != null) {
+        if (!positions[vicName]) positions[vicName] = [];
+        if (positions[vicName].length < 600)
+          positions[vicName].push({ x: e.user_X, y: e.user_Y, z: e.user_Z, team: e.user_team_num ?? 0 });
+      }
+    });
+    // Compléter avec les positions de kills pour les joueurs manquants
+    kills.forEach(k => {
+      if (!positions[k.attacker]) positions[k.attacker] = [];
+      if (positions[k.attacker].length < 600)
         positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam });
-        if (!positions[k.victim]) positions[k.victim] = [];
+      if (!positions[k.victim]) positions[k.victim] = [];
+      if (positions[k.victim].length < 600)
         positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam });
-      });
-      console.log(`Fallback positions from kills only: ${Object.keys(positions).length} players`);
-    }
+    });
+    console.log(`Positions (player_hurt): ${Object.keys(positions).length} players, ex: ${Object.keys(positions)[0]} → ${Object.values(positions)[0]?.length} pts`);
+  } catch(e) {
+    console.warn('Positions warning:', e.message);
+    // Fallback minimal : kills seulement
+    kills.forEach(k => {
+      if (!positions[k.attacker]) positions[k.attacker] = [];
+      positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam });
+      if (!positions[k.victim]) positions[k.victim] = [];
+      positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam });
+    });
   }
 
   console.log(`Positions: ${Object.keys(positions).length} players, sample sizes: ${Object.entries(positions).slice(0,3).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
