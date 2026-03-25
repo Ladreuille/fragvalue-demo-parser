@@ -20,7 +20,7 @@ const upload = multer({
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.1.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.2.0' }));
 
 app.post('/parse', upload.single('demo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier reçu.' });
@@ -46,14 +46,15 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   const playerNames = [...new Set(playerInfoRaw.map(p => p.name).filter(Boolean))];
   console.log(`Players: ${playerNames.join(', ')}`);
 
-  // ── 2. Kills avec coords X/Y ──────────────────────────────────────────────
-  // @laihoe/demoparser2 : parseEvent(path, event, playerProps, otherProps)
-  // playerProps = champs récupérés pour chaque joueur impliqué (attacker + victim)
-  // Les props X, Y, Z sont des positions du joueur au moment de l'event
+  // Map steamid → name
+  const steamToName = {};
+  playerInfoRaw.forEach(p => { if (p.steamid && p.name) steamToName[String(p.steamid)] = p.name; });
+
+  // ── 2. Kills ──────────────────────────────────────────────────────────────
   const killEvents = parseEvent(
     demoPath,
     'player_death',
-    ['X', 'Y', 'Z', 'team_num'],          // player props (attacker + victim séparément)
+    ['X', 'Y', 'Z', 'team_num'],
     ['weapon', 'headshot', 'thrusmoke', 'penetrated', 'total_rounds_played']
   );
 
@@ -75,11 +76,6 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     isWallbang:   (e.penetrated ?? 0) > 0,
   })).filter(k => k.attacker !== 'Unknown' && k.victim !== 'Unknown');
 
-  // Debug : afficher le premier kill pour vérifier les champs
-  if (killEvents.length > 0) {
-    console.log('Sample kill event keys:', Object.keys(killEvents[0]).join(', '));
-    console.log('Sample kill event:', JSON.stringify(killEvents[0]));
-  }
   console.log(`Kills: ${kills.length}`);
 
   // ── 3. Map name ───────────────────────────────────────────────────────────
@@ -91,7 +87,6 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     }
   } catch(e) {
     const known = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass'];
-    // Chercher dans les kills s'il y a un indice
     for (const m of known) { if (demoPath.includes(m)) { mapName = m; break; } }
   }
   console.log(`Map: ${mapName}`);
@@ -106,27 +101,87 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   const totalRounds = rounds.length || 1;
   console.log(`Rounds: ${totalRounds}`);
 
-  // ── 5. Positions (ticks samplés) ──────────────────────────────────────────
+  // ── 5. Positions via parseTicks avec sample manuel ─────────────────────────
+  // Stratégie : on essaie parseTicks, si ca crash on reconstruit depuis les kills
   let positions = {};
+
   try {
-    // Signature correcte : parseTicks(path, [props]) — PAS de 3ème argument
+    console.log('Trying parseTicks...');
     const tickData = parseTicks(demoPath, ['X', 'Y', 'Z', 'team_num', 'steamid']);
-    // Map steamid → nickname depuis playerInfoRaw
-    const steamToName = {};
-    playerInfoRaw.forEach(p => { if (p.steamid && p.name) steamToName[p.steamid] = p.name; });
-    tickData.forEach(t => {
-      if (t.X == null) return;
-      const name = steamToName[t.steamid] || t.steamid;
-      if (!name) return;
+
+    // Vérifier que tickData est bien itérable
+    if (!tickData || typeof tickData[Symbol.iterator] !== 'function') {
+      throw new Error('parseTicks did not return iterable');
+    }
+
+    let i = 0;
+    const SAMPLE = 128; // 1 tick sur 128 pour éviter surcharge mémoire
+    for (const t of tickData) {
+      i++;
+      if (i % SAMPLE !== 0) continue;
+      if (t.X == null) continue;
+      const name = steamToName[String(t.steamid)] || String(t.steamid);
+      if (!name) continue;
       if (!positions[name]) positions[name] = [];
-      positions[name].push({ tick: t.tick, x: t.X, y: t.Y, z: t.Z, team: t.team_num });
-    });
+      // Limiter à 500 points par joueur max
+      if (positions[name].length >= 500) continue;
+      positions[name].push({ x: t.X, y: t.Y, z: t.Z, team: t.team_num });
+    }
+
     const fp = Object.keys(positions)[0];
-    if (fp) console.log(`Positions sample — ${fp}: ${positions[fp].length} ticks`);
+    if (fp) {
+      console.log(`parseTicks OK — ${fp}: ${positions[fp].length} points`);
+    } else {
+      throw new Error('parseTicks returned no usable positions');
+    }
+
   } catch(e) {
-    console.warn('Positions warning:', e.message);
+    console.warn('parseTicks failed:', e.message);
+    console.log('Fallback: reconstructing positions from kills + hurt events...');
+
+    // FALLBACK : reconstruire les positions depuis player_hurt + kills
+    // player_hurt donne des positions fréquentes et fiables
+    try {
+      const hurtEvents = parseEvent(
+        demoPath, 'player_hurt',
+        ['X', 'Y', 'Z', 'team_num'],
+        ['total_rounds_played']
+      );
+
+      hurtEvents.forEach(e => {
+        // Attacker position
+        const attName = e.attacker_name || e.attacker;
+        if (attName && attName !== 'Unknown' && e.attacker_X != null) {
+          if (!positions[attName]) positions[attName] = [];
+          if (positions[attName].length < 400) {
+            positions[attName].push({ x: e.attacker_X, y: e.attacker_Y, z: e.attacker_Z, team: e.attacker_team_num ?? 0 });
+          }
+        }
+        // Victim position
+        const vicName = e.user_name || e.user;
+        if (vicName && vicName !== 'Unknown' && e.user_X != null) {
+          if (!positions[vicName]) positions[vicName] = [];
+          if (positions[vicName].length < 400) {
+            positions[vicName].push({ x: e.user_X, y: e.user_Y, z: e.user_Z, team: e.user_team_num ?? 0 });
+          }
+        }
+      });
+      console.log(`Fallback positions from player_hurt: ${Object.keys(positions).length} players`);
+    } catch(e2) {
+      console.warn('player_hurt fallback failed:', e2.message);
+
+      // FALLBACK 2 : utiliser uniquement les positions de kills (moins dense mais fiable)
+      kills.forEach(k => {
+        if (!positions[k.attacker]) positions[k.attacker] = [];
+        positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam });
+        if (!positions[k.victim]) positions[k.victim] = [];
+        positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam });
+      });
+      console.log(`Fallback positions from kills only: ${Object.keys(positions).length} players`);
+    }
   }
-  console.log(`Positions: ${Object.keys(positions).length} players`);
+
+  console.log(`Positions: ${Object.keys(positions).length} players, sample sizes: ${Object.entries(positions).slice(0,3).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
 
   // ── 6. Grenades ───────────────────────────────────────────────────────────
   let grenades = [];
@@ -153,7 +208,7 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   }
   console.log(`Grenades: ${grenades.length}`);
 
-  // ── 7. Player stats depuis les kills ──────────────────────────────────────
+  // ── 7. Player stats ───────────────────────────────────────────────────────
   const statsMap = {};
   kills.forEach(k => {
     if (!statsMap[k.attacker]) statsMap[k.attacker] = { name: k.attacker, kills: 0, deaths: 0, hs: 0 };
@@ -163,12 +218,12 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     if (k.isHeadshot) statsMap[k.attacker].hs++;
   });
   const playerStats = Object.values(statsMap).map(p => ({
-    name:  p.name,
-    kills: p.kills,
+    name:   p.name,
+    kills:  p.kills,
     deaths: p.deaths,
-    hs:    p.hs,
-    kd:    p.deaths > 0 ? (p.kills / p.deaths).toFixed(2) : p.kills.toFixed(2),
-    hsPct: p.kills > 0  ? ((p.hs / p.kills) * 100).toFixed(1) : '0.0',
+    hs:     p.hs,
+    kd:     p.deaths > 0 ? (p.kills / p.deaths).toFixed(2) : p.kills.toFixed(2),
+    hsPct:  p.kills > 0  ? ((p.hs / p.kills) * 100).toFixed(1) : '0.0',
   })).sort((a, b) => b.kills - a.kills);
 
   // ── 8. Duel zones ─────────────────────────────────────────────────────────
@@ -223,4 +278,4 @@ function computeDuelZones(kills, mapName) {
   }));
 }
 
-app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 v6.1 on port ${PORT}`));
+app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 v6.2 on port ${PORT}`));
