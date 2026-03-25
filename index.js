@@ -8,7 +8,23 @@ const { parseEvent, parsePlayerInfo, parseTicks } = require('@laihoe/demoparser2
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: '*' }));
+// CORS : autoriser Vercel + localhost
+app.use(cors({
+  origin: [
+    'https://frag-value.vercel.app',
+    'https://frag-value-git-main-ladreuilles-projects.vercel.app',
+    /\.vercel\.app$/,
+    'http://localhost:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false,
+}));
+
+// Preflight OPTIONS pour toutes les routes
+app.options('*', cors());
 app.use(express.json());
 
 const upload = multer({
