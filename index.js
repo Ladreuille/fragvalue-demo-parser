@@ -125,30 +125,36 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     const hurtEvents = parseEvent(
       demoPath, 'player_hurt',
       ['X', 'Y', 'Z', 'team_num'],
-      ['total_rounds_played']
+      ['total_rounds_played', 'tick']
     );
     hurtEvents.forEach(e => {
+      const round = e.total_rounds_played ?? 0;
+      const tick  = e.tick ?? 0;
       const attName = e.attacker_name || e.attacker;
       if (attName && attName !== 'Unknown' && e.attacker_X != null) {
         if (!positions[attName]) positions[attName] = [];
-        if (positions[attName].length < 600)
-          positions[attName].push({ x: e.attacker_X, y: e.attacker_Y, z: e.attacker_Z, team: e.attacker_team_num ?? 0 });
+        if (positions[attName].length < 1200)
+          positions[attName].push({ x: e.attacker_X, y: e.attacker_Y, z: e.attacker_Z, team: e.attacker_team_num ?? 0, round, tick });
       }
       const vicName = e.user_name || e.user;
       if (vicName && vicName !== 'Unknown' && e.user_X != null) {
         if (!positions[vicName]) positions[vicName] = [];
-        if (positions[vicName].length < 600)
-          positions[vicName].push({ x: e.user_X, y: e.user_Y, z: e.user_Z, team: e.user_team_num ?? 0 });
+        if (positions[vicName].length < 1200)
+          positions[vicName].push({ x: e.user_X, y: e.user_Y, z: e.user_Z, team: e.user_team_num ?? 0, round, tick });
       }
     });
-    // Compléter avec les positions de kills pour les joueurs manquants
+    // Compléter avec les positions de kills (avec round + tick)
     kills.forEach(k => {
       if (!positions[k.attacker]) positions[k.attacker] = [];
-      if (positions[k.attacker].length < 600)
-        positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam });
+      if (positions[k.attacker].length < 1200)
+        positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam, round: k.round, tick: 0, isDead: false });
       if (!positions[k.victim]) positions[k.victim] = [];
-      if (positions[k.victim].length < 600)
-        positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam });
+      if (positions[k.victim].length < 1200)
+        positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam, round: k.round, tick: 1, isDead: true });
+    });
+    // Trier chaque joueur par round puis tick
+    Object.keys(positions).forEach(name => {
+      positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
     });
     console.log(`Positions (player_hurt): ${Object.keys(positions).length} players, ex: ${Object.keys(positions)[0]} → ${Object.values(positions)[0]?.length} pts`);
   } catch(e) {
