@@ -71,11 +71,12 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     demoPath,
     'player_death',
     ['X', 'Y', 'Z', 'team_num'],
-    ['weapon', 'headshot', 'thrusmoke', 'penetrated', 'total_rounds_played']
+    ['weapon', 'headshot', 'thrusmoke', 'penetrated', 'total_rounds_played', 'tick']
   );
 
   const kills = killEvents.map(e => ({
     round:        e.total_rounds_played ?? 0,
+    tick:         e.tick ?? 0,
     attacker:     e.attacker_name  || e.attacker || 'Unknown',
     attackerTeam: e.attacker_team_num ?? 0,
     attackerX:    e.attacker_X ?? 0,
@@ -117,11 +118,38 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   const totalRounds = rounds.length || 1;
   console.log(`Rounds: ${totalRounds}`);
 
-  // ── 5. Positions via player_hurt (léger et fiable) ──────────────────────────
-  // parseTicks charge trop de mémoire sur les grosses démos → OOM
-  // player_hurt donne des positions précises à chaque échange de dégâts
+  // ── 5. Positions : player_footstep + player_hurt + kills ────────────────────
+  // player_footstep = positions continues à chaque pas (léger, ~200 events/joueur/round)
+  // player_hurt = positions aux échanges de dégâts
+  // kills = positions de mort
   let positions = {};
+
+  // Fonction utilitaire pour ajouter une position
+  const addPos = (name, x, y, z, team, round, tick) => {
+    if (!name || name === 'Unknown' || x == null) return;
+    if (!positions[name]) positions[name] = [];
+    if (positions[name].length < 2000)
+      positions[name].push({ x, y, z, team: team ?? 0, round: round ?? 0, tick: tick ?? 0 });
+  };
+
   try {
+    // 1. player_footstep — positions continues à chaque pas
+    try {
+      const footEvents = parseEvent(
+        demoPath, 'player_footstep',
+        ['X', 'Y', 'Z', 'team_num'],
+        ['total_rounds_played', 'tick']
+      );
+      footEvents.forEach(e => {
+        const name = e.user_name || e.user;
+        addPos(name, e.user_X, e.user_Y, e.user_Z, e.user_team_num, e.total_rounds_played, e.tick);
+      });
+      console.log(`Footstep positions: ${Object.keys(positions).length} players`);
+    } catch(fe) {
+      console.warn('player_footstep failed:', fe.message);
+    }
+
+    // 2. player_hurt — enrichir avec positions de dégâts
     const hurtEvents = parseEvent(
       demoPath, 'player_hurt',
       ['X', 'Y', 'Z', 'team_num'],
@@ -130,29 +158,17 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     hurtEvents.forEach(e => {
       const round = e.total_rounds_played ?? 0;
       const tick  = e.tick ?? 0;
-      const attName = e.attacker_name || e.attacker;
-      if (attName && attName !== 'Unknown' && e.attacker_X != null) {
-        if (!positions[attName]) positions[attName] = [];
-        if (positions[attName].length < 1200)
-          positions[attName].push({ x: e.attacker_X, y: e.attacker_Y, z: e.attacker_Z, team: e.attacker_team_num ?? 0, round, tick });
-      }
-      const vicName = e.user_name || e.user;
-      if (vicName && vicName !== 'Unknown' && e.user_X != null) {
-        if (!positions[vicName]) positions[vicName] = [];
-        if (positions[vicName].length < 1200)
-          positions[vicName].push({ x: e.user_X, y: e.user_Y, z: e.user_Z, team: e.user_team_num ?? 0, round, tick });
-      }
+      addPos(e.attacker_name || e.attacker, e.attacker_X, e.attacker_Y, e.attacker_Z, e.attacker_team_num, round, tick);
+      addPos(e.user_name || e.user, e.user_X, e.user_Y, e.user_Z, e.user_team_num, round, tick);
     });
-    // Compléter avec les positions de kills (avec round + tick)
+
+    // 3. Kills — positions de mort
     kills.forEach(k => {
-      if (!positions[k.attacker]) positions[k.attacker] = [];
-      if (positions[k.attacker].length < 1200)
-        positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam, round: k.round, tick: 0, isDead: false });
-      if (!positions[k.victim]) positions[k.victim] = [];
-      if (positions[k.victim].length < 1200)
-        positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam, round: k.round, tick: 1, isDead: true });
+      addPos(k.attacker, k.attackerX, k.attackerY, k.attackerZ, k.attackerTeam, k.round, k.tick || 0);
+      addPos(k.victim,   k.victimX,   k.victimY,   k.victimZ,   k.victimTeam,   k.round, (k.tick || 0) + 1);
     });
-    // Trier chaque joueur par round puis tick
+
+    // 4. Trier par round puis tick pour l'interpolation
     Object.keys(positions).forEach(name => {
       positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
     });
