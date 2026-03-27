@@ -88,6 +88,13 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     isWallbang:   (e.penetrated ?? 0) > 0,
   })).filter(k => k.attacker !== 'Unknown' && k.victim !== 'Unknown');
   console.log(`Kills: ${kills.length}`);
+  if (kills.length > 0) {
+    const kX = kills.map(k => k.attackerX), kY = kills.map(k => k.attackerY);
+    console.log(`Kill coord range: X[${Math.min(...kX).toFixed(0)}, ${Math.max(...kX).toFixed(0)}] Y[${Math.min(...kY).toFixed(0)}, ${Math.max(...kY).toFixed(0)}]`);
+    // Sample tick range pour calculer durée rounds
+    const r1kills = kills.filter(k => k.round === 1);
+    if (r1kills.length > 0) console.log(`Round 1 tick range: ${Math.min(...r1kills.map(k=>k.tick))} - ${Math.max(...r1kills.map(k=>k.tick))}`);
+  }
 
   // ── 3. Map ───────────────────────────────────────────────────────────────
   let mapName = 'de_dust2';
@@ -148,6 +155,12 @@ async function parseCS2Demo(demoPath, targetPlayer) {
         });
         footstepCount = Object.values(positions).reduce((s, v) => s + v.length, 0);
         console.log(`Footstep positions added: ${footstepCount} total`);
+      // Debug : afficher les coords min/max pour vérifier la projection
+      const allX = [], allY = [];
+      Object.values(positions).forEach(pts => pts.forEach(p => { allX.push(p.x); allY.push(p.y); }));
+      if (allX.length > 0) {
+        console.log(`Footstep coord range: X[${Math.min(...allX).toFixed(0)}, ${Math.max(...allX).toFixed(0)}] Y[${Math.min(...allY).toFixed(0)}, ${Math.max(...allY).toFixed(0)}]`);
+      }
       }
     } catch(e1) {
       console.warn('Footstep v1 failed:', e1.message);
