@@ -8,7 +8,6 @@ const { parseEvent, parsePlayerInfo } = require('@laihoe/demoparser2');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// CORS : autoriser Vercel + localhost
 app.use(cors({
   origin: [
     'https://frag-value.vercel.app',
@@ -22,8 +21,6 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: false,
 }));
-
-// Preflight OPTIONS pour toutes les routes
 app.options('*', cors());
 app.use(express.json());
 
@@ -36,11 +33,11 @@ const upload = multer({
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.2.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.3.0' }));
 
 app.post('/parse', upload.single('demo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier reçu.' });
-  const demoPath   = req.file.path;
+  const demoPath     = req.file.path;
   const targetPlayer = req.body.player || null;
   console.log(`Parsing: ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(1)} MB)`);
   res.setTimeout(300000);
@@ -57,19 +54,17 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
 
 async function parseCS2Demo(demoPath, targetPlayer) {
 
-  // ── 1. Infos joueurs ──────────────────────────────────────────────────────
+  // ── 1. Infos joueurs ─────────────────────────────────────────────────────
   const playerInfoRaw = parsePlayerInfo(demoPath);
-  const playerNames = [...new Set(playerInfoRaw.map(p => p.name).filter(Boolean))];
+  const playerNames   = [...new Set(playerInfoRaw.map(p => p.name).filter(Boolean))];
   console.log(`Players: ${playerNames.join(', ')}`);
 
-  // Map steamid → name
   const steamToName = {};
   playerInfoRaw.forEach(p => { if (p.steamid && p.name) steamToName[String(p.steamid)] = p.name; });
 
-  // ── 2. Kills ──────────────────────────────────────────────────────────────
+  // ── 2. Kills ─────────────────────────────────────────────────────────────
   const killEvents = parseEvent(
-    demoPath,
-    'player_death',
+    demoPath, 'player_death',
     ['X', 'Y', 'Z', 'team_num'],
     ['weapon', 'headshot', 'thrusmoke', 'penetrated', 'total_rounds_played', 'tick']
   );
@@ -87,128 +82,138 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     victimX:      e.user_X ?? 0,
     victimY:      e.user_Y ?? 0,
     victimZ:      e.user_Z ?? 0,
-    weapon:       e.weapon    || '',
+    weapon:       e.weapon  || '',
     isHeadshot:   !!e.headshot,
     thruSmoke:    !!e.thrusmoke,
     isWallbang:   (e.penetrated ?? 0) > 0,
   })).filter(k => k.attacker !== 'Unknown' && k.victim !== 'Unknown');
-
   console.log(`Kills: ${kills.length}`);
 
-  // ── 3. Map name ───────────────────────────────────────────────────────────
+  // ── 3. Map ───────────────────────────────────────────────────────────────
   let mapName = 'de_dust2';
   try {
-    const serverInfo = parseEvent(demoPath, 'server_info', [], ['map_name']);
-    if (serverInfo.length > 0 && serverInfo[0].map_name) {
-      mapName = serverInfo[0].map_name.replace(/^workshop\/\d+\//, '');
-    }
-  } catch(e) {
-    const known = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass'];
-    for (const m of known) { if (demoPath.includes(m)) { mapName = m; break; } }
-  }
+    const si = parseEvent(demoPath, 'server_info', [], ['map_name']);
+    if (si.length > 0 && si[0].map_name)
+      mapName = si[0].map_name.replace(/^workshop\/\d+\//, '');
+  } catch(e) {}
   console.log(`Map: ${mapName}`);
 
-  // ── 4. Rounds ─────────────────────────────────────────────────────────────
+  // ── 4. Rounds ────────────────────────────────────────────────────────────
   const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played']);
   const rounds = roundEndEvents.map((e, i) => ({
     round:  e.total_rounds_played ?? i + 1,
     winner: e.winner ?? 0,
     reason: e.reason ?? 0,
   }));
-  const totalRounds = rounds.length || 1;
-  console.log(`Rounds: ${totalRounds}`);
+  console.log(`Rounds: ${rounds.length}`);
 
-  // ── 5. Positions : player_footstep + player_hurt + kills ────────────────────
-  // player_footstep = positions continues à chaque pas (léger, ~200 events/joueur/round)
-  // player_hurt = positions aux échanges de dégâts
-  // kills = positions de mort
+  // ── 5. Positions ─────────────────────────────────────────────────────────
+  // Stratégie multi-sources pour maximiser la couverture :
+  // Source A : player_footstep   → position à chaque pas (~3-5/seconde)
+  // Source B : weapon_fire       → position à chaque tir
+  // Source C : player_hurt       → position lors de dégâts
+  // Source D : kills             → position à la mort
+  // Toutes sources fusionnées, triées par tick, limitées à 3000/joueur
+
   let positions = {};
+  const MAX_POS = 3000;
 
-  // Fonction utilitaire pour ajouter une position
   const addPos = (name, x, y, z, team, round, tick) => {
-    if (!name || name === 'Unknown' || x == null) return;
+    if (!name || name === 'Unknown' || x == null || x === 0 && y === 0) return;
     if (!positions[name]) positions[name] = [];
-    if (positions[name].length < 2000)
-      positions[name].push({ x, y, z, team: team ?? 0, round: round ?? 0, tick: tick ?? 0 });
+    if (positions[name].length >= MAX_POS) return;
+    positions[name].push({ x, y, z: z||0, team: team||0, round: round||0, tick: tick||0 });
   };
 
+  // Source A — player_footstep (meilleure couverture des déplacements)
+  // demoparser2 : pour player_footstep, le joueur est dans 'user', coords dans player props
+  let footstepCount = 0;
   try {
-    // 1. player_footstep — positions continues à chaque pas
+    // Tester les deux signatures possibles selon version demoparser2
+    let footEvents = [];
     try {
-      const footEvents = parseEvent(
-        demoPath, 'player_footstep',
-        ['X', 'Y', 'Z', 'team_num'],
-        ['total_rounds_played', 'tick']
-      );
-      footEvents.forEach(e => {
-        const name = e.user_name || e.user;
-        addPos(name, e.user_X, e.user_Y, e.user_Z, e.user_team_num, e.total_rounds_played, e.tick);
-      });
-      console.log(`Footstep positions: ${Object.keys(positions).length} players`);
-    } catch(fe) {
-      console.warn('player_footstep failed:', fe.message);
+      // Signature v1 : user props = X,Y,Z,team_num
+      footEvents = parseEvent(demoPath, 'player_footstep', ['X', 'Y', 'Z', 'team_num'], ['total_rounds_played', 'tick']);
+      if (footEvents.length > 0) {
+        const sample = footEvents[0];
+        console.log(`Footstep sample keys: ${Object.keys(sample).join(', ')}`);
+        footEvents.forEach(e => {
+          // user_ prefix pour le joueur principal de l'event
+          const name = e.user_name || e.user || steamToName[String(e.user_steamid)] || steamToName[String(e.userid)];
+          const x = e.user_X ?? e.X ?? null;
+          const y = e.user_Y ?? e.Y ?? null;
+          const z = e.user_Z ?? e.Z ?? null;
+          const team = e.user_team_num ?? e.team_num ?? 0;
+          addPos(name, x, y, z, team, e.total_rounds_played, e.tick);
+        });
+        footstepCount = Object.values(positions).reduce((s, v) => s + v.length, 0);
+        console.log(`Footstep positions added: ${footstepCount} total`);
+      }
+    } catch(e1) {
+      console.warn('Footstep v1 failed:', e1.message);
+      // Signature v2 : pas de player props
+      try {
+        footEvents = parseEvent(demoPath, 'player_footstep', [], ['total_rounds_played', 'tick', 'userid']);
+        console.log(`Footstep v2 sample: ${footEvents.length > 0 ? Object.keys(footEvents[0]).join(', ') : 'empty'}`);
+      } catch(e2) {
+        console.warn('Footstep v2 failed:', e2.message);
+      }
     }
-
-    // 2. player_hurt — enrichir avec positions de dégâts
-    const hurtEvents = parseEvent(
-      demoPath, 'player_hurt',
-      ['X', 'Y', 'Z', 'team_num'],
-      ['total_rounds_played', 'tick']
-    );
-    hurtEvents.forEach(e => {
-      const round = e.total_rounds_played ?? 0;
-      const tick  = e.tick ?? 0;
-      addPos(e.attacker_name || e.attacker, e.attacker_X, e.attacker_Y, e.attacker_Z, e.attacker_team_num, round, tick);
-      addPos(e.user_name || e.user, e.user_X, e.user_Y, e.user_Z, e.user_team_num, round, tick);
-    });
-
-    // 3. Kills — positions de mort
-    kills.forEach(k => {
-      addPos(k.attacker, k.attackerX, k.attackerY, k.attackerZ, k.attackerTeam, k.round, k.tick || 0);
-      addPos(k.victim,   k.victimX,   k.victimY,   k.victimZ,   k.victimTeam,   k.round, (k.tick || 0) + 1);
-    });
-
-    // 4. Trier par round puis tick pour l'interpolation
-    Object.keys(positions).forEach(name => {
-      positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
-    });
-    console.log(`Positions (player_hurt): ${Object.keys(positions).length} players, ex: ${Object.keys(positions)[0]} → ${Object.values(positions)[0]?.length} pts`);
   } catch(e) {
-    console.warn('Positions warning:', e.message);
-    // Fallback minimal : kills seulement
-    kills.forEach(k => {
-      if (!positions[k.attacker]) positions[k.attacker] = [];
-      positions[k.attacker].push({ x: k.attackerX, y: k.attackerY, z: k.attackerZ, team: k.attackerTeam });
-      if (!positions[k.victim]) positions[k.victim] = [];
-      positions[k.victim].push({ x: k.victimX, y: k.victimY, z: k.victimZ, team: k.victimTeam });
-    });
+    console.warn('Footstep outer error:', e.message);
   }
 
-  console.log(`Positions: ${Object.keys(positions).length} players, sample sizes: ${Object.entries(positions).slice(0,3).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
+  // Source B — weapon_fire (position à chaque tir, très précis)
+  try {
+    const fireEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['total_rounds_played', 'tick']);
+    fireEvents.forEach(e => {
+      const name = e.user_name || e.user;
+      addPos(name, e.user_X ?? e.X, e.user_Y ?? e.Y, e.user_Z ?? e.Z,
+             e.user_team_num ?? e.team_num, e.total_rounds_played, e.tick);
+    });
+    console.log(`After weapon_fire: ${Object.entries(positions).slice(0,3).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
+  } catch(e) { console.warn('weapon_fire positions:', e.message); }
 
-  // ── 6. Grenades ───────────────────────────────────────────────────────────
+  // Source C — player_hurt (positions aux échanges)
+  try {
+    const hurtEvents = parseEvent(demoPath, 'player_hurt', ['X', 'Y', 'Z', 'team_num'], ['total_rounds_played', 'tick']);
+    hurtEvents.forEach(e => {
+      const r = e.total_rounds_played ?? 0, t = e.tick ?? 0;
+      addPos(e.attacker_name || e.attacker, e.attacker_X, e.attacker_Y, e.attacker_Z, e.attacker_team_num, r, t);
+      addPos(e.user_name     || e.user,     e.user_X,     e.user_Y,     e.user_Z,     e.user_team_num,     r, t);
+    });
+  } catch(e) { console.warn('player_hurt positions:', e.message); }
+
+  // Source D — kills
+  kills.forEach(k => {
+    addPos(k.attacker, k.attackerX, k.attackerY, k.attackerZ, k.attackerTeam, k.round, k.tick);
+    addPos(k.victim,   k.victimX,   k.victimY,   k.victimZ,   k.victimTeam,   k.round, k.tick + 1);
+  });
+
+  // Tri final par round+tick
+  Object.keys(positions).forEach(name => {
+    positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
+  });
+
+  const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
+  console.log(`Positions final: ${Object.keys(positions).length} players, ${totalPos} total pts`);
+  console.log(`Sample: ${Object.entries(positions).slice(0,4).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
+
+  // ── 6. Grenades ──────────────────────────────────────────────────────────
   let grenades = [];
   try {
-    const grenadeEvents = parseEvent(
-      demoPath, 'weapon_fire',
-      ['X', 'Y', 'Z', 'team_num'],
-      ['weapon']
-    );
     const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade']);
-    grenades = grenadeEvents
-      .filter(e => grenadeTypes.has(e.weapon))
-      .map(e => ({
-        round:   e.total_rounds_played ?? 0,
-        type:    e.weapon,
-        thrower: e.user_name || e.user || 'Unknown',
-        team:    e.user_team_num ?? 0,
-        startX:  e.user_X ?? 0,
-        startY:  e.user_Y ?? 0,
-        startZ:  e.user_Z ?? 0,
-      }));
-  } catch(e) {
-    console.warn('Grenades warning:', e.message);
-  }
+    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'total_rounds_played', 'tick']);
+    grenades = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => ({
+      round:   e.total_rounds_played ?? 0,
+      type:    e.weapon,
+      thrower: e.user_name || e.user || 'Unknown',
+      team:    e.user_team_num ?? 0,
+      startX:  e.user_X ?? 0,
+      startY:  e.user_Y ?? 0,
+      startZ:  e.user_Z ?? 0,
+    }));
+  } catch(e) { console.warn('Grenades warning:', e.message); }
   console.log(`Grenades: ${grenades.length}`);
 
   // ── 7. Player stats ───────────────────────────────────────────────────────
@@ -221,12 +226,9 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     if (k.isHeadshot) statsMap[k.attacker].hs++;
   });
   const playerStats = Object.values(statsMap).map(p => ({
-    name:   p.name,
-    kills:  p.kills,
-    deaths: p.deaths,
-    hs:     p.hs,
-    kd:     p.deaths > 0 ? (p.kills / p.deaths).toFixed(2) : p.kills.toFixed(2),
-    hsPct:  p.kills > 0  ? ((p.hs / p.kills) * 100).toFixed(1) : '0.0',
+    name:  p.name, kills: p.kills, deaths: p.deaths, hs: p.hs,
+    kd:    p.deaths > 0 ? (p.kills/p.deaths).toFixed(2) : p.kills.toFixed(2),
+    hsPct: p.kills  > 0 ? ((p.hs/p.kills)*100).toFixed(1) : '0.0',
   })).sort((a, b) => b.kills - a.kills);
 
   // ── 8. Duel zones ─────────────────────────────────────────────────────────
@@ -235,14 +237,10 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   // ── 9. Target player ──────────────────────────────────────────────────────
   const allNames = playerStats.map(p => p.name);
   const resolvedTarget = targetPlayer && allNames.includes(targetPlayer)
-    ? targetPlayer
-    : playerStats[0]?.name || null;
+    ? targetPlayer : playerStats[0]?.name || null;
 
   return {
-    meta: {
-      map: mapName, rounds: totalRounds, totalKills: kills.length,
-      players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget,
-    },
+    meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget },
     kills: kills.slice(0, 5000),
     positions, grenades, rounds, playerStats, duelZones,
   };
@@ -281,4 +279,4 @@ function computeDuelZones(kills, mapName) {
   }));
 }
 
-app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 v6.2 on port ${PORT}`));
+app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 v6.3 on port ${PORT}`));
