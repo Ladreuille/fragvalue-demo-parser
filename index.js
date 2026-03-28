@@ -202,7 +202,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   const { parseTicks } = require('@laihoe/demoparser2');
   let positions = {};
-  const TICK_SAMPLE = 8; // 1 tick sur 8 → ~8fps de positions (64tick/8=8fps, 128tick/8=16fps)
+  const TICK_SAMPLE = 32; // 1 tick sur 32 → ~2-4fps positions, suffisant pour replay fluide
+  // sessionStorage limite ~5MB — 32 donne ~3MB pour 10 joueurs
 
   try {
     const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'total_rounds_played']);
@@ -213,8 +214,12 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       // Échantillonnage : garder 1 tick sur TICK_SAMPLE
       if (idx % TICK_SAMPLE !== 0) return;
 
-      const name = row.name || steamToName[String(row.steamid)] || null;
-      if (!name || name === 'unknown') return;
+      // Résoudre le nom : d'abord row.name, sinon steamToName
+      const rawName = row.name || row.player_name || null;
+      const name = rawName && rawName !== 'unknown' && rawName !== ''
+        ? rawName
+        : (row.steamid ? steamToName[String(row.steamid)] : null);
+      if (!name || name === 'unknown' || name === '') return;
 
       const x = row.X ?? row.x ?? null;
       const y = row.Y ?? row.y ?? null;
@@ -226,6 +231,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       const tick  = row.tick ?? 0;
 
       if (!positions[name]) positions[name] = [];
+      if (positions[name].length >= 8000) return; // max 8K pts/joueur
       positions[name].push({
         x: Math.round(x),
         y: Math.round(y),
