@@ -235,6 +235,21 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     });
     console.log(`sidToName resolved: ${Object.values(sidToName).join(', ')}`);
 
+    // Debug : compter rows par joueur avant filtrage
+    const rowCountBySid = {};
+    const validCoordBySid = {};
+    tickData.forEach(row => {
+      const sid = String(row.steamid||'');
+      if(!sid) return;
+      rowCountBySid[sid] = (rowCountBySid[sid]||0) + 1;
+      const x = row.X??row.x??null, y = row.Y??row.y??null;
+      if(x!=null && y!=null && !(x===0&&y===0) && Math.abs(x)<=10000 && Math.abs(y)<=10000)
+        validCoordBySid[sid] = (validCoordBySid[sid]||0) + 1;
+    });
+    Object.entries(sidToName).forEach(([sid,name]) => {
+      console.log(`  ${name}: ${rowCountBySid[sid]||0} rows total, ${validCoordBySid[sid]||0} valid coords`);
+    });
+
     tickData.forEach((row, idx) => {
       // Échantillonnage : garder 1 tick sur TICK_SAMPLE
       if (idx % TICK_SAMPLE !== 0) return;
