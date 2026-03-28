@@ -148,12 +148,38 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     console.log(`round_end sample keys: ${Object.keys(s).join(', ')}`);
     console.log(`round_end[0]: winner=${s.winner} reason=${s.reason} tick=${s.tick} rounds=${s.total_rounds_played}`);
   }
-  const rounds = roundEndEvents.map((e, i) => ({
-    round:   e.total_rounds_played ?? i + 1,
-    winner:  e.winner ?? e.winner_team ?? 0,
-    reason:  e.reason ?? e.win_reason ?? 0,
-    endTick: e.tick ?? 0,
-  }));
+  // winner=null signifie que le champ existe mais est null dans demoparser2
+  // Dans CS2, winner vient du champ 'winner' de round_end_reason
+  // On déduit le gagnant depuis le round_official_end ou depuis les kills
+  const rounds = roundEndEvents.map((e, i) => {
+    // Tenter de lire winner (peut être null, 0, 2, ou 3)
+    let winner = e.winner ?? e.winner_team ?? null;
+    // Si winner est null ou 0, on le laisse à 0 — sera résolu côté frontend
+    if (winner === null) winner = 0;
+    return {
+      round:   e.total_rounds_played ?? i + 1,
+      winner,
+      reason:  e.reason ?? 0,
+      endTick: e.tick ?? 0,
+    };
+  });
+
+  // Tenter round_official_end pour avoir le winner
+  try {
+    const officialEnd = parseEvent(demoPath, 'round_mvp', [], ['total_rounds_played', 'tick']);
+    // round_announce_win a le winner
+    const announceWin = parseEvent(demoPath, 'round_announce_win', [], ['winner', 'total_rounds_played', 'tick']);
+    if (announceWin.length > 0) {
+      console.log(`round_announce_win[0]: winner=${announceWin[0].winner} rounds=${announceWin[0].total_rounds_played}`);
+      announceWin.forEach(e => {
+        const r = (e.total_rounds_played ?? 1) - 1; // index 0-based
+        if (rounds[r] && e.winner != null) rounds[r].winner = e.winner;
+      });
+    }
+  } catch(e) { console.warn('round_announce_win:', e.message); }
+
+  const winnerCheck = rounds.slice(0,3).map(r=>`R${r.round}:w${r.winner}`).join(' ');
+  console.log(`Rounds winner check: ${winnerCheck}`);
 
   // Récupérer le tick de fin de freeze (= début réel du round, joueurs peuvent bouger)
   const roundStartTicks = {}; // round → tick de début
@@ -169,110 +195,72 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   console.log(`Rounds: ${rounds.length}`);
 
-  // ── 5. Positions ─────────────────────────────────────────────────────────
-  // Stratégie multi-sources pour maximiser la couverture :
-  // Source A : player_footstep   → position à chaque pas (~3-5/seconde)
-  // Source B : weapon_fire       → position à chaque tir
-  // Source C : player_hurt       → position lors de dégâts
-  // Source D : kills             → position à la mort
-  // Toutes sources fusionnées, triées par tick, limitées à 3000/joueur
+  // ── 5. Positions continues via parseTicks ────────────────────────────────
+  // parseTicks donne X/Y/team_num à chaque tick enregistré dans la démo
+  // On échantillonne 1 tick sur TICK_SAMPLE pour garder un payload raisonnable
+  // tout en ayant ~8-16 positions/seconde par joueur → replay très fluide
 
+  const { parseTicks } = require('@laihoe/demoparser2');
   let positions = {};
-  const MAX_POS = 5000;
+  const TICK_SAMPLE = 8; // 1 tick sur 8 → ~8fps de positions (64tick/8=8fps, 128tick/8=16fps)
 
-  const addPos = (name, x, y, z, team, round, tick) => {
-    if (!name || name === 'Unknown' || x == null || x === 0 && y === 0) return;
-    if (!positions[name]) positions[name] = [];
-    if (positions[name].length >= MAX_POS) return;
-    // Arrondir à l'entier pour réduire la taille JSON
-    positions[name].push({
-      x: Math.round(x),
-      y: Math.round(y),
-      team: team||0,
-      round: round||0,
-      tick: tick||0
-    });
-  };
-
-  // Source A — player_footstep (meilleure couverture des déplacements)
-  // demoparser2 : pour player_footstep, le joueur est dans 'user', coords dans player props
-  let footstepCount = 0;
   try {
-    // Tester les deux signatures possibles selon version demoparser2
-    let footEvents = [];
-    try {
-      // Signature v1 : user props = X,Y,Z,team_num
-      footEvents = parseEvent(demoPath, 'player_footstep', ['X', 'Y', 'Z', 'team_num'], ['total_rounds_played', 'tick']);
-      if (footEvents.length > 0) {
-        const sample = footEvents[0];
-        console.log(`Footstep sample keys: ${Object.keys(sample).join(', ')}`);
-        footEvents.forEach(e => {
-          // user_ prefix pour le joueur principal de l'event
-          const name = e.user_name || e.user || steamToName[String(e.user_steamid)] || steamToName[String(e.userid)];
-          const x = e.user_X ?? e.X ?? null;
-          const y = e.user_Y ?? e.Y ?? null;
-          const z = e.user_Z ?? e.Z ?? null;
-          const team = e.user_team_num ?? e.team_num ?? 0;
-          addPos(name, x, y, z, team, e.total_rounds_played, e.tick);
-        });
-        footstepCount = Object.values(positions).reduce((s, v) => s + v.length, 0);
-        console.log(`Footstep positions added: ${footstepCount} total`);
-      // Debug : afficher les coords min/max pour vérifier la projection
-      const allX = [], allY = [];
-      Object.values(positions).forEach(pts => pts.forEach(p => { allX.push(p.x); allY.push(p.y); }));
-      if (allX.length > 0) {
-        console.log(`Footstep coord range: X[${Math.min(...allX).toFixed(0)}, ${Math.max(...allX).toFixed(0)}] Y[${Math.min(...allY).toFixed(0)}, ${Math.max(...allY).toFixed(0)}]`);
-      }
-      }
-    } catch(e1) {
-      console.warn('Footstep v1 failed:', e1.message);
-      // Signature v2 : pas de player props
-      try {
-        footEvents = parseEvent(demoPath, 'player_footstep', [], ['total_rounds_played', 'tick', 'userid']);
-        console.log(`Footstep v2 sample: ${footEvents.length > 0 ? Object.keys(footEvents[0]).join(', ') : 'empty'}`);
-      } catch(e2) {
-        console.warn('Footstep v2 failed:', e2.message);
-      }
-    }
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'total_rounds_played']);
+    console.log(`parseTicks raw rows: ${tickData.length}`);
+
+    // Associer steamid → nom via steamToName
+    tickData.forEach((row, idx) => {
+      // Échantillonnage : garder 1 tick sur TICK_SAMPLE
+      if (idx % TICK_SAMPLE !== 0) return;
+
+      const name = row.name || steamToName[String(row.steamid)] || null;
+      if (!name || name === 'unknown') return;
+
+      const x = row.X ?? row.x ?? null;
+      const y = row.Y ?? row.y ?? null;
+      if (x == null || y == null || (x === 0 && y === 0)) return;
+      if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return; // coords aberrantes
+
+      const team  = row.team_num ?? 0;
+      const round = row.total_rounds_played ?? 0;
+      const tick  = row.tick ?? 0;
+
+      if (!positions[name]) positions[name] = [];
+      positions[name].push({
+        x: Math.round(x),
+        y: Math.round(y),
+        team,
+        round,
+        tick,
+      });
+    });
+
+    // Tri par round + tick
+    Object.keys(positions).forEach(name => {
+      positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
+    });
+
+    const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
+    console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
+    console.log(`Sample: ${Object.entries(positions).slice(0,4).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
+
   } catch(e) {
-    console.warn('Footstep outer error:', e.message);
+    console.warn('parseTicks failed:', e.message);
+    // Fallback footstep si parseTicks non disponible
+    try {
+      const footEvents = parseEvent(demoPath, 'player_footstep', ['X', 'Y', 'team_num'], ['total_rounds_played', 'tick']);
+      footEvents.forEach(e => {
+        const name = e.user_name || steamToName[String(e.user_steamid)] || null;
+        if (!name) return;
+        const x = e.user_X ?? null, y = e.user_Y ?? null;
+        if (x == null || y == null || (x === 0 && y === 0)) return;
+        if (!positions[name]) positions[name] = [];
+        positions[name].push({ x: Math.round(x), y: Math.round(y), team: e.user_team_num ?? 0, round: e.total_rounds_played ?? 0, tick: e.tick ?? 0 });
+      });
+      Object.keys(positions).forEach(n => positions[n].sort((a,b) => a.round!==b.round?a.round-b.round:a.tick-b.tick));
+      console.log(`Fallback footstep: ${Object.values(positions).reduce((s,v)=>s+v.length,0)} pts`);
+    } catch(e2) { console.warn('Fallback footstep also failed:', e2.message); }
   }
-
-  // Source B — weapon_fire (position à chaque tir, très précis)
-  try {
-    const fireEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['total_rounds_played', 'tick']);
-    fireEvents.forEach(e => {
-      const name = e.user_name || e.user;
-      addPos(name, e.user_X ?? e.X, e.user_Y ?? e.Y, e.user_Z ?? e.Z,
-             e.user_team_num ?? e.team_num, e.total_rounds_played, e.tick);
-    });
-    console.log(`After weapon_fire: ${Object.entries(positions).slice(0,3).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
-  } catch(e) { console.warn('weapon_fire positions:', e.message); }
-
-  // Source C — player_hurt (positions aux échanges)
-  try {
-    const hurtEvents = parseEvent(demoPath, 'player_hurt', ['X', 'Y', 'Z', 'team_num'], ['total_rounds_played', 'tick']);
-    hurtEvents.forEach(e => {
-      const r = e.total_rounds_played ?? 0, t = e.tick ?? 0;
-      addPos(e.attacker_name || e.attacker, e.attacker_X, e.attacker_Y, e.attacker_Z, e.attacker_team_num, r, t);
-      addPos(e.user_name     || e.user,     e.user_X,     e.user_Y,     e.user_Z,     e.user_team_num,     r, t);
-    });
-  } catch(e) { console.warn('player_hurt positions:', e.message); }
-
-  // Source D — kills
-  kills.forEach(k => {
-    addPos(k.attacker, k.attackerX, k.attackerY, k.attackerZ, k.attackerTeam, k.round, k.tick);
-    addPos(k.victim,   k.victimX,   k.victimY,   k.victimZ,   k.victimTeam,   k.round, k.tick + 1);
-  });
-
-  // Tri final par round+tick
-  Object.keys(positions).forEach(name => {
-    positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
-  });
-
-  const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
-  console.log(`Positions final: ${Object.keys(positions).length} players, ${totalPos} total pts`);
-  console.log(`Sample: ${Object.entries(positions).slice(0,4).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
 
   // ── 6. Grenades ──────────────────────────────────────────────────────────
   let grenades = [];
