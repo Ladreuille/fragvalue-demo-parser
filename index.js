@@ -222,16 +222,31 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     }
 
     // Associer steamid → nom via steamToName
-    // Construire sidToName depuis steamToName EN PRIORITÉ (source fiable)
-    // puis compléter avec les noms dans parseTicks
-    const sidToName = {...steamToName}; // copie directe : steamid→name déjà résolu
+    // Logger le type exact des steamids dans parseTicks vs steamToName
+    const sampleSids = new Map();
+    tickData.slice(0, 1000).forEach(row => {
+      const sid = row.steamid;
+      const sidStr = String(sid);
+      if (!sampleSids.has(sidStr)) {
+        sampleSids.set(sidStr, { type: typeof sid, val: sid, name: row.name||'' });
+      }
+    });
+    console.log('steamToName keys types:', Object.keys(steamToName).slice(0,3).map(k => `${k}(${typeof k})`).join(', '));
+    console.log('parseTicks steamid types:', [...sampleSids.entries()].slice(0,3).map(([k,v]) => `${k}(${v.type})=${v.name}`).join(', '));
+    
+    // Construire sidToName en normalisant les deux côtés
+    const sidToName = {};
+    // Ajouter steamToName (clés = strings)
+    Object.entries(steamToName).forEach(([k,v]) => { sidToName[String(k)] = v; });
+    // Compléter avec noms parseTicks
     tickData.forEach(row => {
-      const sid = String(row.steamid || '');
-      if (!sid || sid === 'undefined' || sidToName[sid]) return;
+      const sid = String(row.steamid ?? '');
+      if (!sid || sid === 'undefined' || sid === 'null') return;
+      if (sidToName[sid]) return;
       const n = row.name || row.player_name || '';
       if (n && n !== 'unknown' && n !== '') sidToName[sid] = n;
     });
-    console.log(`sidToName resolved: ${Object.values(sidToName).join(', ')}`);
+    console.log(`sidToName resolved (${Object.keys(sidToName).length}): ${Object.values(sidToName).join(', ')}`);
 
     // Debug : compter rows par joueur avant filtrage
     const rowCountBySid = {};
