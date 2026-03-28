@@ -222,16 +222,14 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     }
 
     // Associer steamid → nom via steamToName
-    // Construire d'abord un map steamid→name complet depuis tous les rows
-    // (certains rows ont name='', on prend le premier name non-vide par steamid)
-    const sidToName = {};
+    // Construire sidToName depuis steamToName EN PRIORITÉ (source fiable)
+    // puis compléter avec les noms dans parseTicks
+    const sidToName = {...steamToName}; // copie directe : steamid→name déjà résolu
     tickData.forEach(row => {
       const sid = String(row.steamid || '');
-      if (!sid || sid === 'undefined') return;
-      if (sidToName[sid]) return; // déjà résolu
+      if (!sid || sid === 'undefined' || sidToName[sid]) return;
       const n = row.name || row.player_name || '';
       if (n && n !== 'unknown' && n !== '') sidToName[sid] = n;
-      else if (steamToName[sid]) sidToName[sid] = steamToName[sid];
     });
     console.log(`sidToName resolved: ${Object.values(sidToName).join(', ')}`);
 
@@ -285,6 +283,9 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
     const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
     console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
+    console.log(`Joueurs dans positions: ${Object.keys(positions).join(', ')}`);
+    const missing = playerNames.filter(n => !positions[n]);
+    if (missing.length) console.log(`Joueurs MANQUANTS dans positions: ${missing.join(', ')}`);
     console.log(`Sample: ${Object.entries(positions).slice(0,4).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
 
   } catch(e) {
