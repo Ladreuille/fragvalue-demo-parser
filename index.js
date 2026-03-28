@@ -137,7 +137,7 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   // Toutes sources fusionnées, triées par tick, limitées à 3000/joueur
 
   let positions = {};
-  const MAX_POS = 3000;
+  const MAX_POS = 5000;
 
   const addPos = (name, x, y, z, team, round, tick) => {
     if (!name || name === 'Unknown' || x == null || x === 0 && y === 0) return;
