@@ -222,28 +222,38 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     }
 
     // Associer steamid → nom via steamToName
+    // Construire d'abord un map steamid→name complet depuis tous les rows
+    // (certains rows ont name='', on prend le premier name non-vide par steamid)
+    const sidToName = {};
+    tickData.forEach(row => {
+      const sid = String(row.steamid || '');
+      if (!sid || sid === 'undefined') return;
+      if (sidToName[sid]) return; // déjà résolu
+      const n = row.name || row.player_name || '';
+      if (n && n !== 'unknown' && n !== '') sidToName[sid] = n;
+      else if (steamToName[sid]) sidToName[sid] = steamToName[sid];
+    });
+    console.log(`sidToName resolved: ${Object.values(sidToName).join(', ')}`);
+
     tickData.forEach((row, idx) => {
       // Échantillonnage : garder 1 tick sur TICK_SAMPLE
       if (idx % TICK_SAMPLE !== 0) return;
 
-      // Résoudre le nom : d'abord row.name, sinon steamToName
-      const rawName = row.name || row.player_name || null;
-      const name = rawName && rawName !== 'unknown' && rawName !== ''
-        ? rawName
-        : (row.steamid ? steamToName[String(row.steamid)] : null);
-      if (!name || name === 'unknown' || name === '') return;
+      const sid = String(row.steamid || '');
+      const name = sidToName[sid] || steamToName[sid] || null;
+      if (!name) return;
 
       const x = row.X ?? row.x ?? null;
       const y = row.Y ?? row.y ?? null;
       if (x == null || y == null || (x === 0 && y === 0)) return;
-      if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return; // coords aberrantes
+      if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return;
 
       const team  = row.team_num ?? 0;
       const round = row.total_rounds_played ?? 0;
       const tick  = row.tick ?? 0;
 
       if (!positions[name]) positions[name] = [];
-      if (positions[name].length >= 8000) return; // max 8K pts/joueur
+      if (positions[name].length >= 8000) return;
       positions[name].push({
         x: Math.round(x),
         y: Math.round(y),
