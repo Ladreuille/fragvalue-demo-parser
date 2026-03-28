@@ -42,7 +42,7 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
   console.log(`Parsing: ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(1)} MB)`);
   res.setTimeout(300000);
   try {
-    const result = await parseCS2Demo(demoPath, targetPlayer);
+    const result = await parseCS2Demo(demoPath, targetPlayer, req.file.originalname || '');
     res.json({ success: true, data: result });
   } catch (err) {
     console.error('Parse error:', err.message);
@@ -52,7 +52,7 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
   }
 });
 
-async function parseCS2Demo(demoPath, targetPlayer) {
+async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   // ── 1. Infos joueurs ─────────────────────────────────────────────────────
   const playerInfoRaw = parsePlayerInfo(demoPath);
@@ -100,9 +100,37 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   let mapName = 'de_dust2';
   try {
     const si = parseEvent(demoPath, 'server_info', [], ['map_name']);
-    if (si.length > 0 && si[0].map_name)
-      mapName = si[0].map_name.replace(/^workshop\/\d+\//, '');
-  } catch(e) {}
+    console.log(`server_info events: ${si.length}`);
+    if (si.length > 0) {
+      console.log(`server_info[0] keys: ${Object.keys(si[0]).join(', ')}`);
+      console.log(`server_info[0].map_name: ${si[0].map_name}`);
+      const raw = si[0].map_name || si[0].map || '';
+      if (raw) mapName = raw.replace(/^workshop\/\d+\//, '').replace(/^.*[\/\\]/, '').trim();
+    }
+  } catch(e) {
+    console.warn('server_info error:', e.message);
+    // Fallback : essayer de lire la map depuis le nom du fichier
+  }
+
+  // Fallback 2 : lire depuis les events de début de partie
+  if (mapName === 'de_dust2') {
+    try {
+      const matchStart = parseEvent(demoPath, 'cs_match_start_ss', [], ['map_name']);
+      if (matchStart.length > 0 && matchStart[0].map_name) {
+        mapName = matchStart[0].map_name.replace(/^workshop\/\d+\//, '').trim();
+        console.log(`Map from cs_match_start_ss: ${mapName}`);
+      }
+    } catch(e) {}
+  }
+
+  // Fallback 3 : nom du fichier .dem uploadé
+  if (mapName === 'de_dust2') {
+    const fileBasename = require('path').basename(originalName || '', '.dem').toLowerCase();
+    const knownMaps = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass','de_vertigo','de_cache'];
+    const foundMap = knownMaps.find(m => fileBasename.includes(m.replace('de_','')) || fileBasename.includes(m));
+    if (foundMap) { mapName = foundMap; console.log(`Map from filename: ${mapName}`); }
+  }
+
   console.log(`Map: ${mapName}`);
 
   // ── 4. Rounds ────────────────────────────────────────────────────────────
