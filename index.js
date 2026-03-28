@@ -107,10 +107,15 @@ async function parseCS2Demo(demoPath, targetPlayer) {
 
   // ── 4. Rounds ────────────────────────────────────────────────────────────
   const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
+  if (roundEndEvents.length > 0) {
+    const s = roundEndEvents[0];
+    console.log(`round_end sample keys: ${Object.keys(s).join(', ')}`);
+    console.log(`round_end[0]: winner=${s.winner} reason=${s.reason} tick=${s.tick} rounds=${s.total_rounds_played}`);
+  }
   const rounds = roundEndEvents.map((e, i) => ({
     round:   e.total_rounds_played ?? i + 1,
-    winner:  e.winner ?? 0,
-    reason:  e.reason ?? 0,
+    winner:  e.winner ?? e.winner_team ?? 0,
+    reason:  e.reason ?? e.win_reason ?? 0,
     endTick: e.tick ?? 0,
   }));
 
