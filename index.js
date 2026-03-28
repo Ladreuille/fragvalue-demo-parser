@@ -106,12 +106,26 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   console.log(`Map: ${mapName}`);
 
   // ── 4. Rounds ────────────────────────────────────────────────────────────
-  const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played']);
+  const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
   const rounds = roundEndEvents.map((e, i) => ({
-    round:  e.total_rounds_played ?? i + 1,
-    winner: e.winner ?? 0,
-    reason: e.reason ?? 0,
+    round:   e.total_rounds_played ?? i + 1,
+    winner:  e.winner ?? 0,
+    reason:  e.reason ?? 0,
+    endTick: e.tick ?? 0,
   }));
+
+  // Récupérer le tick de fin de freeze (= début réel du round, joueurs peuvent bouger)
+  const roundStartTicks = {}; // round → tick de début
+  try {
+    const freezeEndEvents = parseEvent(demoPath, 'round_freeze_end', [], ['total_rounds_played', 'tick']);
+    freezeEndEvents.forEach(e => {
+      roundStartTicks[e.total_rounds_played ?? 0] = e.tick ?? 0;
+    });
+    console.log(`Freeze end events: ${freezeEndEvents.length}`);
+  } catch(e) {
+    console.warn('round_freeze_end failed:', e.message);
+  }
+
   console.log(`Rounds: ${rounds.length}`);
 
   // ── 5. Positions ─────────────────────────────────────────────────────────
@@ -255,7 +269,7 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   return {
     meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget },
     kills: kills.slice(0, 5000),
-    positions, grenades, rounds, playerStats, duelZones,
+    positions, grenades, rounds, roundStartTicks, playerStats, duelZones,
   };
 }
 
