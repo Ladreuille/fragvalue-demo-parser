@@ -208,6 +208,18 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   try {
     const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'total_rounds_played']);
     console.log(`parseTicks raw rows: ${tickData.length}`);
+    if (tickData.length > 0) {
+      const sample = tickData[0];
+      console.log(`parseTicks sample keys: ${Object.keys(sample).join(', ')}`);
+      // Collecter steamids uniques et leurs noms
+      const seenIds = new Map();
+      tickData.slice(0,500).forEach(r => {
+        const sid = String(r.steamid);
+        if (!seenIds.has(sid)) seenIds.set(sid, r.name || r.player_name || 'NULL');
+      });
+      console.log(`parseTicks steamids sample: ${[...seenIds.entries()].map(([k,v])=>k+'='+v).join(', ')}`);
+      console.log(`steamToName keys: ${Object.values(steamToName).join(', ')}`);
+    }
 
     // Associer steamid → nom via steamToName
     tickData.forEach((row, idx) => {
