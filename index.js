@@ -143,7 +143,14 @@ async function parseCS2Demo(demoPath, targetPlayer) {
     if (!name || name === 'Unknown' || x == null || x === 0 && y === 0) return;
     if (!positions[name]) positions[name] = [];
     if (positions[name].length >= MAX_POS) return;
-    positions[name].push({ x, y, z: z||0, team: team||0, round: round||0, tick: tick||0 });
+    // Arrondir à l'entier pour réduire la taille JSON
+    positions[name].push({
+      x: Math.round(x),
+      y: Math.round(y),
+      team: team||0,
+      round: round||0,
+      tick: tick||0
+    });
   };
 
   // Source A — player_footstep (meilleure couverture des déplacements)
@@ -266,10 +273,20 @@ async function parseCS2Demo(demoPath, targetPlayer) {
   const resolvedTarget = targetPlayer && allNames.includes(targetPlayer)
     ? targetPlayer : playerStats[0]?.name || null;
 
+  // Compresser les kills pour réduire la taille du payload
+  const compactKills = kills.slice(0, 3000).map(k => ({
+    r: k.round, t: k.tick,
+    a: k.attacker, at: k.attackerTeam,
+    ax: Math.round(k.attackerX), ay: Math.round(k.attackerY),
+    v: k.victim, vt: k.victimTeam,
+    vx: Math.round(k.victimX), vy: Math.round(k.victimY),
+    w: k.weapon, h: k.isHeadshot?1:0, s: k.thruSmoke?1:0, wb: k.isWallbang?1:0,
+  }));
+
   return {
     meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget },
-    kills: kills.slice(0, 5000),
-    positions, grenades, rounds, roundStartTicks, playerStats, duelZones,
+    kills: compactKills,
+    positions, grenades: grenades.slice(0, 500), rounds, roundStartTicks, playerStats, duelZones,
   };
 }
 
