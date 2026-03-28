@@ -96,42 +96,50 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     if (r1kills.length > 0) console.log(`Round 1 tick range: ${Math.min(...r1kills.map(k=>k.tick))} - ${Math.max(...r1kills.map(k=>k.tick))}`);
   }
 
-  // ── 3. Map ───────────────────────────────────────────────────────────────
-  let mapName = 'de_dust2';
+  // ── 3. Map — lire depuis le header binaire du fichier .dem ─────────────
+  // Le format CS2 demo (.dem) commence par un magic "PBDEMS2" suivi d'un header
+  // protobuf qui contient le nom de la map dans les premiers 1024 octets
+  let mapName = 'unknown';
   try {
-    const si = parseEvent(demoPath, 'server_info', [], ['map_name']);
-    console.log(`server_info events: ${si.length}`);
-    if (si.length > 0) {
-      console.log(`server_info[0] keys: ${Object.keys(si[0]).join(', ')}`);
-      console.log(`server_info[0].map_name: ${si[0].map_name}`);
-      const raw = si[0].map_name || si[0].map || '';
-      if (raw) mapName = raw.replace(/^workshop\/\d+\//, '').replace(/^.*[\/\\]/, '').trim();
+    const headerBuf = Buffer.alloc(1024);
+    const fdHeader = fs.openSync(demoPath, 'r');
+    fs.readSync(fdHeader, headerBuf, 0, 1024, 0);
+    fs.closeSync(fdHeader);
+    const headerStr = headerBuf.toString('latin1');
+    // Chercher un pattern "de_XXX" dans le header
+    const knownMaps = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass','de_vertigo','de_cache','de_train','de_cbble','de_tuscan'];
+    const foundInHeader = knownMaps.find(m => headerStr.includes(m));
+    if (foundInHeader) {
+      mapName = foundInHeader;
+      console.log(`Map from binary header: ${mapName}`);
     }
   } catch(e) {
-    console.warn('server_info error:', e.message);
-    // Fallback : essayer de lire la map depuis le nom du fichier
+    console.warn('Header read error:', e.message);
   }
 
-  // Fallback 2 : lire depuis les events de début de partie
-  if (mapName === 'de_dust2') {
+  // Fallback A : server_info event
+  if (mapName === 'unknown') {
     try {
-      const matchStart = parseEvent(demoPath, 'cs_match_start_ss', [], ['map_name']);
-      if (matchStart.length > 0 && matchStart[0].map_name) {
-        mapName = matchStart[0].map_name.replace(/^workshop\/\d+\//, '').trim();
-        console.log(`Map from cs_match_start_ss: ${mapName}`);
+      const si = parseEvent(demoPath, 'server_info', [], ['map_name']);
+      console.log(`server_info events: ${si.length}`);
+      if (si.length > 0 && (si[0].map_name || si[0].map)) {
+        const raw = si[0].map_name || si[0].map || '';
+        mapName = raw.replace(/^workshop\/\d+\//, '').replace(/^.*[\/\\]/, '').trim();
+        console.log(`Map from server_info: ${mapName}`);
       }
-    } catch(e) {}
+    } catch(e) { console.warn('server_info:', e.message); }
   }
 
-  // Fallback 3 : nom du fichier .dem uploadé
-  if (mapName === 'de_dust2') {
+  // Fallback B : nom du fichier uploadé
+  if (mapName === 'unknown') {
     const fileBasename = require('path').basename(originalName || '', '.dem').toLowerCase();
-    const knownMaps = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass','de_vertigo','de_cache'];
-    const foundMap = knownMaps.find(m => fileBasename.includes(m.replace('de_','')) || fileBasename.includes(m));
+    const knownMaps2 = ['de_dust2','de_mirage','de_inferno','de_nuke','de_ancient','de_anubis','de_overpass','de_vertigo','de_cache'];
+    const foundMap = knownMaps2.find(m => fileBasename.includes(m) || fileBasename.includes(m.replace('de_','')));
     if (foundMap) { mapName = foundMap; console.log(`Map from filename: ${mapName}`); }
+    else mapName = 'de_dust2'; // dernier fallback
   }
 
-  console.log(`Map: ${mapName}`);
+  console.log(`Map final: ${mapName}`);
 
   // ── 4. Rounds ────────────────────────────────────────────────────────────
   const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
