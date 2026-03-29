@@ -259,8 +259,9 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const rowCountBySid = {};
     const validCoordBySid = {};
     tickData.forEach(row => {
-      const sid = String(row.steamid||'');
-      if(!sid) return;
+      const sid = typeof row.steamid === 'bigint'
+        ? row.steamid.toString() : String(row.steamid||'');
+      if(!sid || sid==='0') return;
       rowCountBySid[sid] = (rowCountBySid[sid]||0) + 1;
       const x = row.X??row.x??null, y = row.Y??row.y??null;
       if(x!=null && y!=null && !(x===0&&y===0) && Math.abs(x)<=10000 && Math.abs(y)<=10000)
@@ -274,8 +275,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       // Échantillonnage : garder 1 tick sur TICK_SAMPLE
       if (idx % TICK_SAMPLE !== 0) return;
 
-      const sid = String(row.steamid || '');
-      const name = sidToName[sid] || steamToName[sid] || null;
+      // IMPORTANT: utiliser .toString() pour BigInt (pas String() qui ajoute "n")
+      const sid = typeof row.steamid === 'bigint'
+        ? row.steamid.toString()
+        : String(row.steamid ?? '');
+      const name = sidToName[sid] || null;
       if (!name) return;
 
       const x = row.X ?? row.x ?? null;
