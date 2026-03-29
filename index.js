@@ -271,16 +271,21 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       console.log(`  ${name}: ${rowCountBySid[sid]||0} rows total, ${validCoordBySid[sid]||0} valid coords`);
     });
 
-    tickData.forEach((row, idx) => {
-      // Échantillonnage : garder 1 tick sur TICK_SAMPLE
-      if (idx % TICK_SAMPLE !== 0) return;
+    // Compteur par joueur pour l'échantillonnage (pas par index global)
+    const playerRowCount = {};
 
-      // IMPORTANT: utiliser .toString() pour BigInt (pas String() qui ajoute "n")
+    tickData.forEach((row) => {
       const sid = typeof row.steamid === 'bigint'
         ? row.steamid.toString()
         : String(row.steamid ?? '');
       const name = sidToName[sid] || null;
       if (!name) return;
+
+      // Incrémenter le compteur de ce joueur
+      playerRowCount[name] = (playerRowCount[name] || 0) + 1;
+
+      // Échantillonnage PAR JOUEUR : garder 1 row sur TICK_SAMPLE
+      if (playerRowCount[name] % TICK_SAMPLE !== 0) return;
 
       const x = row.X ?? row.x ?? null;
       const y = row.Y ?? row.y ?? null;
@@ -297,7 +302,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         x: Math.round(x),
         y: Math.round(y),
         team,
-        round: round + 1, // parseTicks: total_rounds_played est 0-based, kills/rounds sont 1-based
+        round: round + 1,
         tick,
       });
     });
