@@ -231,18 +231,25 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         sampleSids.set(sidStr, { type: typeof sid, val: sid, name: row.name||'' });
       }
     });
-    console.log('steamToName keys types:', Object.keys(steamToName).slice(0,3).map(k => `${k}(${typeof k})`).join(', '));
-    console.log('parseTicks steamid types:', [...sampleSids.entries()].slice(0,3).map(([k,v]) => `${k}(${v.type})=${v.name}`).join(', '));
-    
-    // Construire sidToName en normalisant les deux côtés
+    // Logger les types exacts pour debug
+    const stKeys = Object.keys(steamToName);
+    console.log('steamToName sample:', stKeys.slice(0,2).map(k=>`"${k}"(${typeof k})=${steamToName[k]}`).join(', '));
+    const firstRow = tickData[0];
+    console.log('parseTicks row[0] steamid:', firstRow?.steamid, 'type:', typeof firstRow?.steamid, 'BigInt?', typeof firstRow?.steamid === 'bigint');
+
+    // Construire sidToName en gérant BigInt
     const sidToName = {};
-    // Ajouter steamToName (clés = strings)
-    Object.entries(steamToName).forEach(([k,v]) => { sidToName[String(k)] = v; });
-    // Compléter avec noms parseTicks
+    // steamToName a des string keys
+    Object.entries(steamToName).forEach(([k,v]) => { sidToName[k] = v; });
+    // parseTicks peut avoir des BigInt steamids
     tickData.forEach(row => {
-      const sid = String(row.steamid ?? '');
-      if (!sid || sid === 'undefined' || sid === 'null') return;
-      if (sidToName[sid]) return;
+      if (!row.steamid) return;
+      // Convertir BigInt → string sans le "n" suffix
+      const sid = typeof row.steamid === 'bigint'
+        ? row.steamid.toString()
+        : String(row.steamid);
+      if (!sid || sid === 'undefined' || sid === 'null' || sid === '0') return;
+      if (sidToName[sid]) return; // déjà résolu via steamToName
       const n = row.name || row.player_name || '';
       if (n && n !== 'unknown' && n !== '') sidToName[sid] = n;
     });
