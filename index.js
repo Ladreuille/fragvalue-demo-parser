@@ -162,14 +162,9 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     console.log(`Freeze end events: ${freezeEndEvents.length}, sample: R${freezeEndEvents[0]?.total_rounds_played} tick=${freezeEndEvents[0]?.tick}`);
   } catch(e) { console.warn('round_freeze_end failed:', e.message); }
 
-  try {
-    const offEndEvents = parseEvent(demoPath, 'round_officially_ended', [], ['total_rounds_played', 'tick']);
-    offEndEvents.forEach(e => {
-      const r = e.total_rounds_played ?? 0;
-      roundEndTicks[r] = e.tick ?? 0;
-    });
-    console.log(`round_officially_ended: ${offEndEvents.length}, sample: R${offEndEvents[0]?.total_rounds_played} tick=${offEndEvents[0]?.tick}`);
-  } catch(e) { console.warn('round_officially_ended failed:', e.message); }
+  // round_officially_ended désactivé — les ticks sont mal alignés avec freezeR
+  // On calculera endTick = startTick du round suivant dans la construction des rounds
+  console.log('endTick calculé via startTick du round suivant');
 
   // Collecter les winners via round_announce_win (plus fiable que round_end)
   const roundWinners = {}; // round_num → winner (2=CT, 3=T)
@@ -229,10 +224,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   const rounds = roundNums.map((freezeR, i) => {
     const startTick = roundStartTicks[freezeR] ?? 0;
-    // endTick : utiliser round_officially_ended, sinon startTick du round suivant
+    // endTick = startTick du round suivant (source la plus fiable)
     const nextFreezeR = roundNums[i+1];
-    const endTick = roundEndTicks[freezeR]
-      || (nextFreezeR !== undefined ? (roundStartTicks[nextFreezeR] ?? 0) - 1 : 0);
+    const endTick = nextFreezeR !== undefined
+      ? (roundStartTicks[nextFreezeR] ?? 0) - 1
+      : startTick + 15000; // dernier round : estimer ~2min max
     return {
       round:      freezeR,
       killsRound: freezeR + 1,
