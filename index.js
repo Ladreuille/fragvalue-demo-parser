@@ -286,7 +286,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         x: Math.round(x),
         y: Math.round(y),
         team,
-        round,
+        round: round + 1, // parseTicks: total_rounds_played est 0-based, kills/rounds sont 1-based
         tick,
       });
     });
