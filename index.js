@@ -142,57 +142,71 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   console.log(`Map final: ${mapName}`);
 
   // ── 4. Rounds ────────────────────────────────────────────────────────────
-  const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
-  if (roundEndEvents.length > 0) {
-    const s = roundEndEvents[0];
-    console.log(`round_end sample keys: ${Object.keys(s).join(', ')}`);
-    console.log(`round_end[0]: winner=${s.winner} reason=${s.reason} tick=${s.tick} rounds=${s.total_rounds_played}`);
-  }
-  // winner=null signifie que le champ existe mais est null dans demoparser2
-  // Dans CS2, winner vient du champ 'winner' de round_end_reason
-  // On déduit le gagnant depuis le round_official_end ou depuis les kills
-  const rounds = roundEndEvents.map((e, i) => {
-    // Tenter de lire winner (peut être null, 0, 2, ou 3)
-    let winner = e.winner ?? e.winner_team ?? null;
-    // Si winner est null ou 0, on le laisse à 0 — sera résolu côté frontend
-    if (winner === null) winner = 0;
-    return {
-      round:   e.total_rounds_played ?? i + 1,
-      winner,
-      reason:  e.reason ?? 0,
-      endTick: e.tick ?? 0,
-    };
-  });
+  // Sources utilisées :
+  // - round_freeze_end → tick de début réel du round (après achat)
+  // - round_officially_ended → tick de fin réel du round
+  // - round_end → winner (mais souvent null dans CS2 demos)
+  // - round_announce_win → winner fiable
+  // - parseTicks total_rounds_played → numéro de round natif CS2 (1-based)
 
-  // Tenter round_official_end pour avoir le winner
-  try {
-    const officialEnd = parseEvent(demoPath, 'round_mvp', [], ['total_rounds_played', 'tick']);
-    // round_announce_win a le winner
-    const announceWin = parseEvent(demoPath, 'round_announce_win', [], ['winner', 'total_rounds_played', 'tick']);
-    if (announceWin.length > 0) {
-      console.log(`round_announce_win[0]: winner=${announceWin[0].winner} rounds=${announceWin[0].total_rounds_played}`);
-      announceWin.forEach(e => {
-        const r = (e.total_rounds_played ?? 1) - 1; // index 0-based
-        if (rounds[r] && e.winner != null) rounds[r].winner = e.winner;
-      });
-    }
-  } catch(e) { console.warn('round_announce_win:', e.message); }
+  // Collecter tous les freeze_end (début de round) et officially_ended (fin de round)
+  const roundStartTicks = {};
+  const roundEndTicks = {};
 
-  const winnerCheck = rounds.slice(0,3).map(r=>`R${r.round}:w${r.winner}`).join(' ');
-  console.log(`Rounds winner check: ${winnerCheck}`);
-
-  // Récupérer le tick de fin de freeze (= début réel du round, joueurs peuvent bouger)
-  const roundStartTicks = {}; // round → tick de début
   try {
     const freezeEndEvents = parseEvent(demoPath, 'round_freeze_end', [], ['total_rounds_played', 'tick']);
     freezeEndEvents.forEach(e => {
-      roundStartTicks[e.total_rounds_played ?? 0] = e.tick ?? 0;
+      const r = e.total_rounds_played ?? 0;
+      roundStartTicks[r] = e.tick ?? 0;
     });
-    console.log(`Freeze end events: ${freezeEndEvents.length}`);
-  } catch(e) {
-    console.warn('round_freeze_end failed:', e.message);
-  }
+    console.log(`Freeze end events: ${freezeEndEvents.length}, sample: R${freezeEndEvents[0]?.total_rounds_played} tick=${freezeEndEvents[0]?.tick}`);
+  } catch(e) { console.warn('round_freeze_end failed:', e.message); }
 
+  try {
+    const offEndEvents = parseEvent(demoPath, 'round_officially_ended', [], ['total_rounds_played', 'tick']);
+    offEndEvents.forEach(e => {
+      const r = e.total_rounds_played ?? 0;
+      roundEndTicks[r] = e.tick ?? 0;
+    });
+    console.log(`round_officially_ended: ${offEndEvents.length}, sample: R${offEndEvents[0]?.total_rounds_played} tick=${offEndEvents[0]?.tick}`);
+  } catch(e) { console.warn('round_officially_ended failed:', e.message); }
+
+  // Collecter les winners via round_announce_win (plus fiable que round_end)
+  const roundWinners = {}; // round_num → winner (2=CT, 3=T)
+  try {
+    const announceWin = parseEvent(demoPath, 'round_announce_win', [], ['winner', 'total_rounds_played', 'tick']);
+    announceWin.forEach(e => {
+      const r = e.total_rounds_played ?? 0;
+      if (e.winner != null) roundWinners[r] = e.winner;
+    });
+    console.log(`round_announce_win: ${announceWin.length}, sample: R${announceWin[0]?.total_rounds_played} winner=${announceWin[0]?.winner}`);
+  } catch(e) { console.warn('round_announce_win failed:', e.message); }
+
+  // Construire la liste des rounds depuis round_freeze_end (source la plus fiable)
+  // Chaque freeze_end = un round commence
+  const roundNums = Object.keys(roundStartTicks).map(Number).sort((a,b)=>a-b);
+  console.log(`Round nums from freeze_end: ${roundNums.join(',')}`);
+
+  // Détecter le knife round : round où kills sont quasi-tous au couteau
+  const knifeRounds = new Set();
+  roundNums.forEach(r => {
+    const rKills = kills.filter(k => k.round === r);
+    if (rKills.length === 0) return;
+    const knifeK = rKills.filter(k => k.weapon && (k.weapon.includes('knife') || k.weapon.includes('bayonet')));
+    if (knifeK.length / rKills.length > 0.5) knifeRounds.add(r);
+  });
+  console.log(`Knife rounds detected: ${[...knifeRounds].join(',') || 'none'}`);
+
+  const rounds = roundNums.map(r => ({
+    round:      r,
+    winner:     roundWinners[r] ?? 0,
+    startTick:  roundStartTicks[r] ?? 0,
+    endTick:    roundEndTicks[r] ?? 0,
+    isKnife:    knifeRounds.has(r),
+  }));
+
+  const winnerCheck = rounds.slice(0,4).map(r=>`R${r.round}:w${r.winner}:knife${r.isKnife?1:0}`).join(' ');
+  console.log(`Rounds check: ${winnerCheck}`);
   console.log(`Rounds: ${rounds.length}`);
 
   // ── 5. Positions continues via parseTicks ────────────────────────────────
