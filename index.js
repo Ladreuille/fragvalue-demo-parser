@@ -188,14 +188,27 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   const roundNums = Object.keys(roundStartTicks).map(Number).sort((a,b)=>a-b);
   console.log(`Round nums from freeze_end: ${roundNums.join(',')}`);
 
-  // Détecter le knife round via kills (kills.round est 1-based, freeze est 0-based)
+  // Détecter le knife round :
+  // 1. Round avec majorité de kills couteau
+  // 2. OU premier round (round 0) si durée < 30sec (knife round sans kill)
+  // 3. OU round dont les kills sont tous "knife"/"bayonet"
   const knifeRounds = new Set();
   roundNums.forEach(freezeR => {
-    const killsR = freezeR + 1; // convertir freeze 0-based → kills 1-based
+    const killsR = freezeR + 1;
     const rKills = kills.filter(k => k.round === killsR);
-    if (rKills.length === 0) return;
-    const knifeK = rKills.filter(k => k.weapon && (k.weapon.includes('knife') || k.weapon.includes('bayonet')));
-    if (knifeK.length / rKills.length > 0.5) knifeRounds.add(freezeR);
+    // Détection par kills couteau
+    if (rKills.length > 0) {
+      const knifeK = rKills.filter(k => k.weapon && (k.weapon.includes('knife') || k.weapon.includes('bayonet')));
+      if (knifeK.length / rKills.length > 0.5) { knifeRounds.add(freezeR); return; }
+    }
+    // Le round 0 avec peu ou pas de kills = probablement le knife round
+    // (les joueurs courent, une équipe gagne, pas forcément de kill)
+    if (freezeR === 0) {
+      const startT = roundStartTicks[0] || 0;
+      const endT   = roundEndTicks[1] || roundEndTicks[0] || 0; // round_officially_ended peut être décalé
+      // Si pas de kill ou kills très peu (≤2), c'est le knife round
+      if (rKills.length <= 2) { knifeRounds.add(0); return; }
+    }
   });
   console.log(`Knife rounds detected (freeze nums): ${[...knifeRounds].join(',') || 'none'}`);
 
@@ -214,15 +227,22 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     console.log(`Winners computed from kills: ${roundNums.slice(0,5).map(r=>`R${r}:${computedWinners[r]||0}`).join(' ')}`);
   }
 
-  const rounds = roundNums.map((freezeR, i) => ({
-    round:      freezeR,      // numéro natif freeze_end (0-based)
-    killsRound: freezeR + 1,  // numéro correspondant dans kills (1-based)
-    displayNum: i + 1,        // numéro affiché à l'utilisateur (1,2,3...)
-    winner:     computedWinners[freezeR] ?? 0,
-    startTick:  roundStartTicks[freezeR] ?? 0,
-    endTick:    roundEndTicks[freezeR] ?? roundEndTicks[freezeR+1] ?? 0,
-    isKnife:    knifeRounds.has(freezeR),
-  }));
+  const rounds = roundNums.map((freezeR, i) => {
+    const startTick = roundStartTicks[freezeR] ?? 0;
+    // endTick : utiliser round_officially_ended, sinon startTick du round suivant
+    const nextFreezeR = roundNums[i+1];
+    const endTick = roundEndTicks[freezeR]
+      || (nextFreezeR !== undefined ? (roundStartTicks[nextFreezeR] ?? 0) - 1 : 0);
+    return {
+      round:      freezeR,
+      killsRound: freezeR + 1,
+      displayNum: i + 1,
+      winner:     computedWinners[freezeR] ?? 0,
+      startTick,
+      endTick,
+      isKnife:    knifeRounds.has(freezeR),
+    };
+  });
 
   const winnerCheck = rounds.slice(0,4).map(r=>`R${r.round}(k${r.killsRound}):w${r.winner}:knife${r.isKnife?1:0}`).join(' ');
   console.log(`Rounds check: ${winnerCheck}`);
