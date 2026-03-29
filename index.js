@@ -307,7 +307,22 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
     console.log(`Joueurs dans positions: ${Object.keys(positions).join(', ')}`);
     const missing = playerNames.filter(n => !positions[n]);
-    if (missing.length) console.log(`Joueurs MANQUANTS dans positions: ${missing.join(', ')}`);
+    if (missing.length) {
+      console.log(`Joueurs MANQUANTS dans positions: ${missing.join(', ')}`);
+      // Trouver leurs steamids dans sidToName pour voir si le match se fait
+      const sidToNameInv = {};
+      Object.entries(sidToName).forEach(([sid,name]) => { sidToNameInv[name] = sid; });
+      missing.forEach(name => {
+        const sid = sidToNameInv[name];
+        console.log(`  MANQUANT ${name}: sid=${sid}, sidToName[sid]=${sidToName[sid]}, posCount=${positions[name]?.length||0}`);
+        // Compter combien de rows parseTicks ont ce steamid
+        const cnt = tickData.filter(r => {
+          const s = typeof r.steamid==='bigint' ? r.steamid.toString() : String(r.steamid??'');
+          return s === sid;
+        }).length;
+        console.log(`  parseTicks rows avec ce sid: ${cnt}`);
+      });
+    }
     console.log(`Sample: ${Object.entries(positions).slice(0,4).map(([k,v])=>`${k}:${v.length}`).join(', ')}`);
 
   } catch(e) {
