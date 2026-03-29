@@ -259,7 +259,9 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   // sessionStorage limite ~5MB — 32 donne ~3MB pour 10 joueurs
 
   try {
-    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'total_rounds_played']);
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num']);
+    // Note: on n'utilise plus total_rounds_played car il est 0-based et mal aligné
+    // On va assigner le round via le tick absolu et les roundStartTicks
     console.log(`parseTicks raw rows: ${tickData.length}`);
     if (tickData.length > 0) {
       const sample = tickData[0];
@@ -345,9 +347,18 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       if (x == null || y == null || (x === 0 && y === 0)) return;
       if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return;
 
-      const team  = row.team_num ?? 0;
-      const round = row.total_rounds_played ?? 0;
-      const tick  = row.tick ?? 0;
+      const team    = row.team_num ?? 0;
+      const absTick = row.tick ?? 0;
+
+      // Assigner le round via tick absolu et roundStartTicks
+      // roundStartTicks: { freezeR: startTick } — trouver le freezeR dont startTick <= absTick
+      let assignedFreezeR = 0;
+      for (const [fr, st] of Object.entries(roundStartTicks)) {
+        const frNum = Number(fr);
+        if (st <= absTick) assignedFreezeR = frNum;
+      }
+      // killsRound = assignedFreezeR + 1 (pour correspondre aux kills 1-based)
+      const killsRound = assignedFreezeR + 1;
 
       if (!positions[name]) positions[name] = [];
       if (positions[name].length >= 8000) return;
@@ -355,14 +366,14 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         x: Math.round(x),
         y: Math.round(y),
         team,
-        round: round + 1,
-        tick,
+        round: killsRound,  // 1-based, aligné avec kills
+        tick:  absTick,     // tick absolu pour interpolation correcte
       });
     });
 
-    // Tri par round + tick
+    // Tri par tick absolu (le round est déjà assigné correctement)
     Object.keys(positions).forEach(name => {
-      positions[name].sort((a, b) => a.round !== b.round ? a.round - b.round : a.tick - b.tick);
+      positions[name].sort((a, b) => a.tick - b.tick);
     });
 
     const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
