@@ -255,14 +255,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   // sessionStorage limite ~5MB — 32 donne ~3MB pour 10 joueurs
 
   try {
-    const tickData = parseTicks(demoPath, [
-      'X', 'Y', 'team_num',
-      'health', 'armor_value', 'has_helmet', 'has_defuser',
-      'current_equip_value', 'active_weapon_name',
-      'active_weapon_ammo', 'total_ammo_left',
-      'flash_duration', 'flash_max_alpha',
-      'grenades',
-    ]);
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num']);
     // Note: on n'utilise plus total_rounds_played car il est 0-based et mal aligné
     // On va assigner le round via le tick absolu et les roundStartTicks
     console.log(`parseTicks raw rows: ${tickData.length}`);
