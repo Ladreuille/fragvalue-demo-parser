@@ -441,18 +441,23 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     ];
     for (const [evName, key] of detonEvents) {
       try {
-        // Essayer avec player props X/Y d'abord, puis sans
+        // Pour les events de détonation, les coords sont dans other props (pas player props)
         let evs = [];
-        try { evs = parseEvent(demoPath, evName, ['X', 'Y'], ['tick']); }
-        catch(e2) { evs = parseEvent(demoPath, evName, [], ['tick']); }
+        try { evs = parseEvent(demoPath, evName, [], ['tick', 'x', 'y']); }
+        catch(e2) {
+          try { evs = parseEvent(demoPath, evName, ['X','Y'], ['tick']); }
+          catch(e3) { evs = parseEvent(demoPath, evName, [], ['tick']); }
+        }
         evs.forEach(e => {
           if (!detonations[key]) detonations[key] = [];
-          // Les coords peuvent être dans X/Y, user_X/Y, ou x/y selon l'event
           const ex = e.x ?? e.X ?? e.user_X ?? 0;
           const ey = e.y ?? e.Y ?? e.user_Y ?? 0;
           detonations[key].push({ tick: e.tick??0, x: Math.round(ex), y: Math.round(ey) });
         });
-        if (evs.length > 0) console.log(`${evName}: ${evs.length} events, sample x=${evs[0].x??evs[0].X??'?'}`);
+        if (evs.length > 0) {
+          const s = evs[0];
+          console.log(`${evName}: ${evs.length} events, sample keys=${Object.keys(s).join(',')}, x=${s.x??s.X??'?'} y=${s.y??s.Y??'?'}`);
+        }
       } catch(e) { console.warn(`${evName} failed:`, e.message); }
     }
 
@@ -508,16 +513,17 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       };
     });
 
-    // Tirs (weapon_fire hors grenades) pour flash de bouche
+    // Tirs (weapon_fire hors grenades) — coords dans user_X/Y (player props)
     const shootEvents = gEvents.filter(e => !grenadeTypes.has(e.weapon));
     shots = shootEvents.map(e => ({
       tick:    e.tick ?? 0,
       shooter: e.user_name || e.user || 'Unknown',
       team:    e.user_team_num ?? 0,
-      x:       Math.round(e.user_X ?? 0),
-      y:       Math.round(e.user_Y ?? 0),
+      x:       Math.round(e.user_X ?? e.X ?? 0),
+      y:       Math.round(e.user_Y ?? e.Y ?? 0),
       weapon:  e.weapon || '',
     })).filter(s => s.x !== 0 || s.y !== 0);
+    console.log(`Shots: ${shots.length}, sample: ${shots[0]?`x=${shots[0].x} y=${shots[0].y} w=${shots[0].weapon}`:'none'}`);
 
   } catch(e) { console.warn('Grenades warning:', e.message); }
   console.log(`Grenades: ${grenades.length}`);
@@ -558,7 +564,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   return {
     meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget },
     kills: compactKills,
-    positions, grenades: grenades.slice(0, 500), rounds, roundStartTicks, playerStats, duelZones,
+    positions, grenades: grenades.slice(0, 800), shots: shots.slice(0, 3000), rounds, roundStartTicks, playerStats, duelZones,
   };
 }
 
