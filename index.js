@@ -251,8 +251,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   const { parseTicks } = require('@laihoe/demoparser2');
   let positions = {};
-  const TICK_SAMPLE = 32; // 1 tick sur 32 → ~2-4fps positions, suffisant pour replay fluide
-  // sessionStorage limite ~5MB — 32 donne ~3MB pour 10 joueurs
+  const TICK_SAMPLE = 16; // 1 tick sur 16 → ~4-8fps positions, mouvements fluides
+  // ~75000 pts total ≈ 1.5MB JSON → bien sous la limite sessionStorage
 
   try {
     const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num']);
@@ -357,7 +357,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       const killsRound = assignedFreezeR + 1;
 
       if (!positions[name]) positions[name] = [];
-      if (positions[name].length >= 8000) return;
+      if (positions[name].length >= 7500) return;
       positions[name].push({
         x: Math.round(x),
         y: Math.round(y),
