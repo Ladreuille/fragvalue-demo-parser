@@ -414,6 +414,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   // ── 6. Grenades avec ticks absolus et events de détonation ─────────────
   let grenades = [];
+  let shots = [];
   try {
     const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade','weapon_decoy']);
     
@@ -440,12 +441,18 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     ];
     for (const [evName, key] of detonEvents) {
       try {
-        const evs = parseEvent(demoPath, evName, ['X', 'Y'], ['tick']);
+        // Essayer avec player props X/Y d'abord, puis sans
+        let evs = [];
+        try { evs = parseEvent(demoPath, evName, ['X', 'Y'], ['tick']); }
+        catch(e2) { evs = parseEvent(demoPath, evName, [], ['tick']); }
         evs.forEach(e => {
           if (!detonations[key]) detonations[key] = [];
-          detonations[key].push({ tick: e.tick??0, x: Math.round(e.user_X??e.X??0), y: Math.round(e.user_Y??e.Y??0) });
+          // Les coords peuvent être dans X/Y, user_X/Y, ou x/y selon l'event
+          const ex = e.x ?? e.X ?? e.user_X ?? 0;
+          const ey = e.y ?? e.Y ?? e.user_Y ?? 0;
+          detonations[key].push({ tick: e.tick??0, x: Math.round(ex), y: Math.round(ey) });
         });
-        console.log(`${evName}: ${evs.length} events`);
+        if (evs.length > 0) console.log(`${evName}: ${evs.length} events, sample x=${evs[0].x??evs[0].X??'?'}`);
       } catch(e) { console.warn(`${evName} failed:`, e.message); }
     }
 
@@ -503,7 +510,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
     // Tirs (weapon_fire hors grenades) pour flash de bouche
     const shootEvents = gEvents.filter(e => !grenadeTypes.has(e.weapon));
-    const shots = shootEvents.map(e => ({
+    shots = shootEvents.map(e => ({
       tick:    e.tick ?? 0,
       shooter: e.user_name || e.user || 'Unknown',
       team:    e.user_team_num ?? 0,
