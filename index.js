@@ -420,14 +420,22 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     
     // Lancer de grenade (position du lanceur + tick absolu)
     const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick']);
-    const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => ({
-      tick:    e.tick ?? 0,
-      type:    e.weapon,
-      thrower: e.user_name || e.user || 'Unknown',
-      team:    e.user_team_num ?? 0,
-      x:       Math.round(e.user_X ?? 0),
-      y:       Math.round(e.user_Y ?? 0),
-    }));
+    const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => {
+      const relTick = e.tick ?? 0;
+      const rnd = e.total_rounds_played ?? null;
+      let absTick = relTick;
+      if (relTick < 10000 && rnd !== null && roundStartTicks[rnd] > 0) {
+        absTick = roundStartTicks[rnd] + relTick;
+      }
+      return {
+        tick:    absTick,
+        type:    e.weapon,
+        thrower: e.user_name || e.user || 'Unknown',
+        team:    e.user_team_num ?? 0,
+        x:       Math.round(e.user_X ?? 0),
+        y:       Math.round(e.user_Y ?? 0),
+      };
+    });
 
     // Détonations : smoke_started, flashbang_detonate, hegrenade_detonate, molotov_detonate, decoy_started
     const detonations = {};
@@ -452,7 +460,17 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
           if (!detonations[key]) detonations[key] = [];
           const ex = e.x ?? e.X ?? e.user_X ?? 0;
           const ey = e.y ?? e.Y ?? e.user_Y ?? 0;
-          detonations[key].push({ tick: e.tick??0, x: Math.round(ex), y: Math.round(ey) });
+          const dt = e.tick??0;
+          const rnd2 = e.total_rounds_played ?? null;
+          let absDetTick = dt;
+          if (dt < 10000 && rnd2 !== null && roundStartTicks[rnd2] > 0) absDetTick = roundStartTicks[rnd2] + dt;
+          else if (dt < 10000 && dt > 0) {
+            // Chercher le round par proximité
+            const candidates = Object.entries(roundStartTicks).filter(([,st]) => st > 0);
+            const best = candidates.reduce((a,b) => Math.abs(Number(a[1])+dt - Math.max(...Object.values(roundStartTicks))) < Math.abs(Number(b[1])+dt - Math.max(...Object.values(roundStartTicks))) ? a : b, candidates[0]);
+            if (best) absDetTick = Number(best[1]) + dt;
+          }
+          detonations[key].push({ tick: absDetTick, x: Math.round(ex), y: Math.round(ey) });
         });
         if (evs.length > 0) {
           const s = evs[0];
@@ -513,17 +531,33 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       };
     });
 
-    // Tirs (weapon_fire hors grenades) — coords dans user_X/Y (player props)
+    // Tirs séparément pour avoir le tick absolu
+    // On mappe chaque tir sur le tick absolu via roundStartTicks
     const shootEvents = gEvents.filter(e => !grenadeTypes.has(e.weapon));
-    shots = shootEvents.map(e => ({
-      tick:    e.tick ?? 0,
-      shooter: e.user_name || e.user || 'Unknown',
-      team:    e.user_team_num ?? 0,
-      x:       Math.round(e.user_X ?? e.X ?? 0),
-      y:       Math.round(e.user_Y ?? e.Y ?? 0),
-      weapon:  e.weapon || '',
-    })).filter(s => s.x !== 0 || s.y !== 0);
-    console.log(`Shots: ${shots.length}, sample: ${shots[0]?`x=${shots[0].x} y=${shots[0].y} w=${shots[0].weapon}`:'none'}`);
+    shots = shootEvents.map(e => {
+      // Trouver le tick absolu : e.tick est relatif au round
+      // On cherche le roundStartTick correspondant au round du tir
+      const relTick = e.tick ?? 0;
+      // Trouver le freezeR dont le startTick <= tick absolu estimé
+      // Heuristique : le tick absolu = relTick + roundStartTick[freezeR]
+      // On trouve le bon round en cherchant dans roundStartTicks
+      let absTick = relTick;
+      // Si relTick < 10000, probablement relatif → ajouter l'offset du round
+      // On utilise total_rounds_played si disponible
+      const rnd = e.total_rounds_played ?? null;
+      if (relTick < 10000 && rnd !== null && roundStartTicks[rnd] > 0) {
+        absTick = roundStartTicks[rnd] + relTick;
+      }
+      return {
+        tick:    absTick,
+        shooter: e.user_name || e.user || 'Unknown',
+        team:    e.user_team_num ?? 0,
+        x:       Math.round(e.user_X ?? e.X ?? 0),
+        y:       Math.round(e.user_Y ?? e.Y ?? 0),
+        weapon:  e.weapon || '',
+      };
+    }).filter(s => s.x !== 0 || s.y !== 0);
+    console.log(`Shots: ${shots.length}, sample tick=${shots[0]?.tick} x=${shots[0]?.x} y=${shots[0]?.y}`);
 
   } catch(e) { console.warn('Grenades warning:', e.message); }
   console.log(`Grenades: ${grenades.length}`);
