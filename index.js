@@ -412,20 +412,106 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     } catch(e2) { console.warn('Fallback footstep also failed:', e2.message); }
   }
 
-  // ── 6. Grenades ──────────────────────────────────────────────────────────
+  // ── 6. Grenades avec ticks absolus et events de détonation ─────────────
   let grenades = [];
   try {
-    const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade']);
-    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'total_rounds_played', 'tick']);
-    grenades = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => ({
-      round:   e.total_rounds_played ?? 0,
+    const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade','weapon_decoy']);
+    
+    // Lancer de grenade (position du lanceur + tick absolu)
+    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick']);
+    const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => ({
+      tick:    e.tick ?? 0,
       type:    e.weapon,
       thrower: e.user_name || e.user || 'Unknown',
       team:    e.user_team_num ?? 0,
-      startX:  e.user_X ?? 0,
-      startY:  e.user_Y ?? 0,
-      startZ:  e.user_Z ?? 0,
+      x:       Math.round(e.user_X ?? 0),
+      y:       Math.round(e.user_Y ?? 0),
     }));
+
+    // Détonations : smoke_started, flashbang_detonate, hegrenade_detonate, molotov_detonate, decoy_started
+    const detonations = {};
+    const detonEvents = [
+      ['smokegrenade_detonate', 'smoke'],
+      ['flashbang_detonate',    'flash'],
+      ['hegrenade_detonate',    'he'],
+      ['molotov_detonate',      'molotov'],
+      ['inferno_startburn',     'inferno'],
+      ['decoy_started',         'decoy'],
+    ];
+    for (const [evName, key] of detonEvents) {
+      try {
+        const evs = parseEvent(demoPath, evName, ['X', 'Y'], ['tick']);
+        evs.forEach(e => {
+          if (!detonations[key]) detonations[key] = [];
+          detonations[key].push({ tick: e.tick??0, x: Math.round(e.user_X??e.X??0), y: Math.round(e.user_Y??e.Y??0) });
+        });
+        console.log(`${evName}: ${evs.length} events`);
+      } catch(e) { console.warn(`${evName} failed:`, e.message); }
+    }
+
+    // Smoke end (durée ~18sec = 2304 ticks)
+    let smokeEnds = {};
+    try {
+      const se = parseEvent(demoPath, 'smokegrenade_expired', ['X','Y'], ['tick']);
+      se.forEach(e => { smokeEnds[e.tick??0] = true; });
+    } catch(e) {}
+
+    // Inferno end
+    let infernoEnds = {};
+    try {
+      const ie = parseEvent(demoPath, 'inferno_expire', ['X','Y'], ['tick']);
+      ie.forEach(e => { infernoEnds[e.tick??0] = true; });
+    } catch(e) {}
+
+    grenades = thrown.map(g => {
+      // Trouver la détonation correspondante (tick le plus proche après le lancer)
+      const key = g.type.includes('smoke') ? 'smoke'
+        : g.type.includes('flash')  ? 'flash'
+        : g.type.includes('hegre')  ? 'he'
+        : g.type.includes('molotov')|| g.type.includes('incgren') ? 'molotov'
+        : g.type.includes('decoy')  ? 'decoy' : null;
+      
+      let detonTick = g.tick + 128; // fallback: 1sec après lancer
+      let detonX = g.x, detonY = g.y;
+      if (key && detonations[key]) {
+        const det = detonations[key].filter(d => d.tick > g.tick && d.tick < g.tick + 10000)
+                                     .sort((a,b) => a.tick - b.tick)[0];
+        if (det) { detonTick = det.tick; detonX = det.x; detonY = det.y; }
+      }
+
+      // Durée de l'effet visuel selon le type
+      const duration = g.type.includes('smoke') ? 2304      // ~18sec
+        : g.type.includes('flash')  ? 192                    // ~1.5sec
+        : g.type.includes('hegre')  ? 64                     // ~0.5sec
+        : g.type.includes('molotov')|| g.type.includes('incgren') ? 896 // ~7sec
+        : g.type.includes('decoy')  ? 1920                   // ~15sec
+        : 128;
+
+      return {
+        tick:      g.tick,
+        detonTick,
+        endTick:   detonTick + duration,
+        type:      g.type,
+        thrower:   g.thrower,
+        team:      g.team,
+        x:         g.x,       // position du lanceur
+        y:         g.y,
+        detonX,               // position d'explosion
+        detonY,
+      };
+    });
+
+    // Tirs (weapon_fire hors grenades) pour flash de bouche
+    const shootEvents = gEvents.filter(e => !grenadeTypes.has(e.weapon));
+    const shots = shootEvents.map(e => ({
+      tick:    e.tick ?? 0,
+      shooter: e.user_name || e.user || 'Unknown',
+      team:    e.user_team_num ?? 0,
+      x:       Math.round(e.user_X ?? 0),
+      y:       Math.round(e.user_Y ?? 0),
+      weapon:  e.weapon || '',
+    })).filter(s => s.x !== 0 || s.y !== 0);
+
   } catch(e) { console.warn('Grenades warning:', e.message); }
   console.log(`Grenades: ${grenades.length}`);
 
