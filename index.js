@@ -430,10 +430,14 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick']);
     const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => {
       const relTick = e.tick ?? 0;
-      const rnd = e.total_rounds_played ?? null;
       let absTick = relTick;
-      if (relTick < 10000 && rnd !== null && roundStartTicks[rnd] > 0) {
-        absTick = roundStartTicks[rnd] + relTick;
+      if (relTick < 10000 && relTick > 0) {
+        // Relatif — ajouter le startTick du round le plus récent avant ce tick
+        const sortedRounds = Object.entries(roundStartTicks)
+          .map(([r,st]) => ({r:Number(r), st:Number(st)}))
+          .filter(({st}) => st > 0)
+          .sort((a,b) => a.st - b.st);
+        if (sortedRounds.length) absTick = sortedRounds[sortedRounds.length-1].st + relTick;
       }
       return {
         tick:    absTick,
@@ -468,17 +472,25 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
           if (!detonations[key]) detonations[key] = [];
           const ex = e.x ?? e.X ?? e.user_X ?? 0;
           const ey = e.y ?? e.Y ?? e.user_Y ?? 0;
-          const dt = e.tick??0;
-          const rnd2 = e.total_rounds_played ?? null;
+          const dt = e.tick ?? 0;
+          // Trouver le tick absolu : chercher le roundStartTick dont start <= dt
+          // Si dt > 10000, déjà absolu
           let absDetTick = dt;
-          if (dt < 10000 && rnd2 !== null && roundStartTicks[rnd2] > 0) absDetTick = roundStartTicks[rnd2] + dt;
-          else if (dt < 10000 && dt > 0) {
-            // Chercher le round par proximité
-            const candidates = Object.entries(roundStartTicks).filter(([,st]) => st > 0);
-            const best = candidates.reduce((a,b) => Math.abs(Number(a[1])+dt - Math.max(...Object.values(roundStartTicks))) < Math.abs(Number(b[1])+dt - Math.max(...Object.values(roundStartTicks))) ? a : b, candidates[0]);
-            if (best) absDetTick = Number(best[1]) + dt;
+          if (dt < 10000 && dt > 0) {
+            // Relatif — trouver le bon round via les roundStartTicks
+            const sortedRounds = Object.entries(roundStartTicks)
+              .map(([r,st]) => ({r:Number(r), st:Number(st)}))
+              .sort((a,b) => a.st - b.st);
+            // Chercher le round dont on est dans la durée
+            for (let ri = sortedRounds.length-1; ri >= 0; ri--) {
+              const {r, st} = sortedRounds[ri];
+              if (st > 0) { absDetTick = st + dt; break; }
+            }
           }
-          detonations[key].push({ tick: absDetTick, x: Math.round(ex), y: Math.round(ey) });
+          // Les coords sont dans e.x, e.y (other props) selon les logs
+          const ex2 = e.x ?? e.X ?? e.user_X ?? 0;
+          const ey2 = e.y ?? e.Y ?? e.user_Y ?? 0;
+          detonations[key].push({ tick: absDetTick, x: Math.round(ex2), y: Math.round(ey2) });
         });
         if (evs.length > 0) {
           const s = evs[0];
@@ -512,9 +524,17 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       let detonTick = g.tick + 128; // fallback: 1sec après lancer
       let detonX = g.x, detonY = g.y;
       if (key && detonations[key]) {
-        const det = detonations[key].filter(d => d.tick > g.tick && d.tick < g.tick + 10000)
-                                     .sort((a,b) => a.tick - b.tick)[0];
-        if (det) { detonTick = det.tick; detonX = det.x; detonY = det.y; }
+        // Chercher la détonation la plus proche après le lancer
+        // Les ticks sont absolus des deux côtés maintenant
+        const candidates = detonations[key]
+          .filter(d => d.x !== 0 && d.y !== 0 && d.tick >= g.tick - 512 && d.tick < g.tick + 20000)
+          .sort((a,b) => Math.abs(a.tick - g.tick) - Math.abs(b.tick - g.tick));
+        if (candidates.length > 0) {
+          const det = candidates[0];
+          detonTick = det.tick > g.tick ? det.tick : g.tick + 256;
+          detonX = det.x;
+          detonY = det.y;
+        }
       }
 
       // Durée de l'effet visuel selon le type
@@ -568,7 +588,9 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     console.log(`Shots: ${shots.length}, sample tick=${shots[0]?.tick} x=${shots[0]?.x} y=${shots[0]?.y}`);
 
   } catch(e) { console.warn('Grenades warning:', e.message); }
-  console.log(`Grenades: ${grenades.length}`);
+  const matchedDeton = grenades.filter(g => g.detonX !== g.x || g.detonY !== g.y).length;
+  console.log(`Grenades: ${grenades.length}, avec détonation distincte: ${matchedDeton}`);
+  if (grenades.length > 0) console.log(`Grenade[0]: tick=${grenades[0].tick} detonTick=${grenades[0].detonTick} x=${grenades[0].x} detonX=${grenades[0].detonX}`);
 
   // ── 7. Player stats ───────────────────────────────────────────────────────
   const statsMap = {};
