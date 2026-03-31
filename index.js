@@ -385,8 +385,14 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
     const sampleAbsTick0 = Object.values(positions)[0]?.[0]?.tick ?? 0;
     const sampleAbsTick1 = Object.values(positions)[0]?.find(p=>p.round===2)?.tick ?? 0;
+    const p0 = Object.values(positions)[0] || [];
     console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
-    console.log(`Sample ticks: round0_first=${sampleAbsTick0}, round1_first=${sampleAbsTick1}`);
+    console.log(`Tick samples: [${p0.slice(0,5).map(p=>p.tick).join(',')}]`);
+    console.log(`Round samples: [${p0.slice(0,5).map(p=>p.round).join(',')}]`);
+    // Compter combien de positions par round
+    const rndCounts = {};
+    p0.forEach(p => { rndCounts[p.round] = (rndCounts[p.round]||0)+1; });
+    console.log(`Positions par round: ${JSON.stringify(rndCounts)}`);
     console.log(`Joueurs dans positions: ${Object.keys(positions).join(', ')}`);
     const missing = playerNames.filter(n => !positions[n]);
     if (missing.length) {
