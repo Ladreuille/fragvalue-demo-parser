@@ -346,26 +346,12 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       const relTick  = row.tick ?? 0;
       const rowRound = row.total_rounds_played ?? null;
 
-      // Convertir tick relatif → absolu via roundStartTicks
-      // parseTicks retourne des ticks RELATIFS au round (0, 16, 32...)
-      // roundStartTicks[freezeR] = tick absolu du début du round
-      let assignedFreezeR = 0;
-      let absTick = relTick;
+      // Convertir tick relatif → absolu
+      // Stratégie : rowRound donne le freezeR, absTick = roundStartTicks[rowRound] + relTick
+      let assignedFreezeR = rowRound ?? 0;
+      let absTick = (roundStartTicks[assignedFreezeR] ?? 0) + relTick;
 
-      if (rowRound !== null && roundStartTicks[rowRound] !== undefined) {
-        // Utiliser total_rounds_played si disponible
-        assignedFreezeR = rowRound;
-        absTick = roundStartTicks[rowRound] + relTick;
-      } else {
-        // Fallback: trouver le round par index de séquence
-        const sortedFreezeR = Object.keys(roundStartTicks).map(Number).sort((a,b)=>a-b);
-        assignedFreezeR = sortedFreezeR[playerRowCount[name] > 0
-          ? Math.min(Math.floor((playerRowCount[name]-1) / (120974/TICK_SAMPLE/sortedFreezeR.length)), sortedFreezeR.length-1)
-          : 0] ?? 0;
-        absTick = (roundStartTicks[assignedFreezeR] ?? 0) + relTick;
-      }
-
-      // killsRound = assignedFreezeR + 1 (pour correspondre aux kills 1-based)
+      // killsRound = assignedFreezeR + 1
       const killsRound = assignedFreezeR + 1;
 
       if (!positions[name]) positions[name] = [];
@@ -385,8 +371,10 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     });
 
     const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
-    const sampleAbsTick = Object.values(positions)[0]?.[0]?.tick ?? 0;
-    console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total, sample absTick=${sampleAbsTick}`);
+    const sampleAbsTick0 = Object.values(positions)[0]?.[0]?.tick ?? 0;
+    const sampleAbsTick1 = Object.values(positions)[0]?.find(p=>p.round===2)?.tick ?? 0;
+    console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
+    console.log(`Sample ticks: round0_first=${sampleAbsTick0}, round1_first=${sampleAbsTick1}`);
     console.log(`Joueurs dans positions: ${Object.keys(positions).join(', ')}`);
     const missing = playerNames.filter(n => !positions[n]);
     if (missing.length) {
