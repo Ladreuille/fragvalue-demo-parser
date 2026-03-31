@@ -183,29 +183,19 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   const roundNums = Object.keys(roundStartTicks).map(Number).sort((a,b)=>a-b);
   console.log(`Round nums from freeze_end: ${roundNums.join(',')}`);
 
-  // Détecter le knife round :
-  // 1. Round avec majorité de kills couteau
-  // 2. OU premier round (round 0) si durée < 30sec (knife round sans kill)
-  // 3. OU round dont les kills sont tous "knife"/"bayonet"
-  const knifeRounds = new Set();
+  // Le round 0 (freezeR=0) est TOUJOURS le knife round en CS2 compétitif
+  const knifeRounds = new Set([0]);
+  // Vérifier aussi les autres rounds (kills couteau)
   roundNums.forEach(freezeR => {
+    if (freezeR === 0) return; // déjà ajouté
     const killsR = freezeR + 1;
     const rKills = kills.filter(k => k.round === killsR);
-    // Détection par kills couteau
     if (rKills.length > 0) {
       const knifeK = rKills.filter(k => k.weapon && (k.weapon.includes('knife') || k.weapon.includes('bayonet')));
-      if (knifeK.length / rKills.length > 0.5) { knifeRounds.add(freezeR); return; }
-    }
-    // Le round 0 avec peu ou pas de kills = probablement le knife round
-    // (les joueurs courent, une équipe gagne, pas forcément de kill)
-    if (freezeR === 0) {
-      const startT = roundStartTicks[0] || 0;
-      const endT   = roundEndTicks[1] || roundEndTicks[0] || 0; // round_officially_ended peut être décalé
-      // Si pas de kill ou kills très peu (≤2), c'est le knife round
-      if (rKills.length <= 2) { knifeRounds.add(0); return; }
+      if (knifeK.length / rKills.length > 0.5) knifeRounds.add(freezeR);
     }
   });
-  console.log(`Knife rounds detected (freeze nums): ${[...knifeRounds].join(',') || 'none'}`);
+  console.log(`Knife rounds detected (freeze nums): ${[...knifeRounds].join(',')}`);
 
   // Déduire winner depuis le dernier kill du round si round_announce_win absent
   const computedWinners = {...roundWinners};
