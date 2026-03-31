@@ -323,8 +323,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
     // Compteur par joueur pour l'échantillonnage (pas par index global)
     const playerRowCount = {};
-    const playerRoundIdx = {}; // tracking round courant par joueur
-    // Rounds triés par startTick pour l'assignation
+    // Rounds triés par startTick pour l'assignation du round via tick absolu
     const sortedFreezeRounds = Object.keys(roundStartTicks)
       .map(Number).sort((a,b) => roundStartTicks[a]-roundStartTicks[b]);
 
@@ -347,23 +346,16 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return;
 
       const team    = row.team_num ?? 0;
-      const relTick = row.tick ?? 0;
+      const absTick = row.tick ?? 0; // tick ABSOLU depuis le début de la démo
 
-      // Assigner le round via compteur cumulatif par joueur
-      // Les rounds sont triés par startTick, on avance au round suivant
-      // quand le relTick repart de 0 (ou proche de 0)
-      if (!playerRoundIdx) playerRoundIdx = {};
-      if (!playerRoundIdx[name]) playerRoundIdx[name] = { freezeR: 0, prevTick: -1 };
-      const pri = playerRoundIdx[name];
-      
-      // Détecter un reset de tick (passage au round suivant)
-      if (relTick < pri.prevTick - 100 && sortedFreezeRounds.length > pri.freezeR + 1) {
-        pri.freezeR = Math.min(pri.freezeR + 1, sortedFreezeRounds.length - 1);
+      // Assigner le round via tick absolu : trouver freezeR dont startTick <= absTick < startTick_suivant
+      let assignedFreezeR = sortedFreezeRounds[0] ?? 0;
+      for (let ri = 0; ri < sortedFreezeRounds.length; ri++) {
+        const fr = sortedFreezeRounds[ri];
+        const st = roundStartTicks[fr] ?? 0;
+        if (st <= absTick) assignedFreezeR = fr;
+        else break;
       }
-      pri.prevTick = relTick;
-      
-      const assignedFreezeR = sortedFreezeRounds[pri.freezeR] ?? 0;
-      const absTick = (roundStartTicks[assignedFreezeR] ?? 0) + relTick;
       const killsRound = assignedFreezeR + 1;
 
       if (!positions[name]) positions[name] = [];
