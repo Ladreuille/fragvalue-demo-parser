@@ -364,14 +364,6 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         team,
         round: killsRound,
         tick:  absTick,
-        // HUD data
-        hp:     row.health ?? 100,
-        armor:  row.armor_value ?? 0,
-        helmet: row.has_helmet ? 1 : 0,
-        weapon: row.active_weapon_name || '',
-        ammo:   row.active_weapon_ammo ?? 0,
-        money:  row.current_equip_value ?? 0,
-        flash:  row.flash_duration ?? 0,
       });
     });
 
