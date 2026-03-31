@@ -419,7 +419,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade','weapon_decoy']);
     
     // Lancer de grenade (position du lanceur + tick absolu)
-    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick']);
+    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick', 'total_rounds_played']);
     const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => {
       const relTick = e.tick ?? 0;
       let absTick = relTick;
