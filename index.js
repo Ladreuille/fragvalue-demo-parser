@@ -255,8 +255,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   // ~75000 pts total ≈ 1.5MB JSON → bien sous la limite sessionStorage
 
   try {
-    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'total_rounds_played']);
-    // total_rounds_played permet de convertir tick relatif → absolu via roundStartTicks
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num']);
+    // On assigne le round via les limites de ticks cumulatifs
     console.log(`parseTicks raw rows: ${tickData.length}`);
     if (tickData.length > 0) {
       const sample = tickData[0];
@@ -323,6 +323,10 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
     // Compteur par joueur pour l'échantillonnage (pas par index global)
     const playerRowCount = {};
+    const playerRoundIdx = {}; // tracking round courant par joueur
+    // Rounds triés par startTick pour l'assignation
+    const sortedFreezeRounds = Object.keys(roundStartTicks)
+      .map(Number).sort((a,b) => roundStartTicks[a]-roundStartTicks[b]);
 
     tickData.forEach((row) => {
       const sid = typeof row.steamid === 'bigint'
@@ -342,16 +346,24 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       if (x == null || y == null || (x === 0 && y === 0)) return;
       if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return;
 
-      const team     = row.team_num ?? 0;
-      const relTick  = row.tick ?? 0;
-      const rowRound = row.total_rounds_played ?? null;
+      const team    = row.team_num ?? 0;
+      const relTick = row.tick ?? 0;
 
-      // Convertir tick relatif → absolu
-      // Stratégie : rowRound donne le freezeR, absTick = roundStartTicks[rowRound] + relTick
-      let assignedFreezeR = rowRound ?? 0;
-      let absTick = (roundStartTicks[assignedFreezeR] ?? 0) + relTick;
-
-      // killsRound = assignedFreezeR + 1
+      // Assigner le round via compteur cumulatif par joueur
+      // Les rounds sont triés par startTick, on avance au round suivant
+      // quand le relTick repart de 0 (ou proche de 0)
+      if (!playerRoundIdx) playerRoundIdx = {};
+      if (!playerRoundIdx[name]) playerRoundIdx[name] = { freezeR: 0, prevTick: -1 };
+      const pri = playerRoundIdx[name];
+      
+      // Détecter un reset de tick (passage au round suivant)
+      if (relTick < pri.prevTick - 100 && sortedFreezeRounds.length > pri.freezeR + 1) {
+        pri.freezeR = Math.min(pri.freezeR + 1, sortedFreezeRounds.length - 1);
+      }
+      pri.prevTick = relTick;
+      
+      const assignedFreezeR = sortedFreezeRounds[pri.freezeR] ?? 0;
+      const absTick = (roundStartTicks[assignedFreezeR] ?? 0) + relTick;
       const killsRound = assignedFreezeR + 1;
 
       if (!positions[name]) positions[name] = [];
