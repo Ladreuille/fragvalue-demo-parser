@@ -572,13 +572,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       // Trouver le freezeR dont le startTick <= tick absolu estimé
       // Heuristique : le tick absolu = relTick + roundStartTick[freezeR]
       // On trouve le bon round en cherchant dans roundStartTicks
-      let absTick = relTick;
-      // Si relTick < 10000, probablement relatif → ajouter l'offset du round
-      // On utilise total_rounds_played si disponible
-      const rnd = e.total_rounds_played ?? null;
-      if (relTick < 10000 && rnd !== null && roundStartTicks[rnd] > 0) {
-        absTick = roundStartTicks[rnd] + relTick;
-      }
+      const rnd = e.total_rounds_played ?? 0;
+      const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
       return {
         tick:    absTick,
         shooter: e.user_name || e.user || 'Unknown',
