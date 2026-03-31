@@ -255,9 +255,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   // ~75000 pts total ≈ 1.5MB JSON → bien sous la limite sessionStorage
 
   try {
-    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num']);
-    // Note: on n'utilise plus total_rounds_played car il est 0-based et mal aligné
-    // On va assigner le round via le tick absolu et les roundStartTicks
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'total_rounds_played']);
+    // total_rounds_played permet de convertir tick relatif → absolu via roundStartTicks
     console.log(`parseTicks raw rows: ${tickData.length}`);
     if (tickData.length > 0) {
       const sample = tickData[0];
@@ -343,16 +342,29 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       if (x == null || y == null || (x === 0 && y === 0)) return;
       if (Math.abs(x) > 10000 || Math.abs(y) > 10000) return;
 
-      const team    = row.team_num ?? 0;
-      const absTick = row.tick ?? 0;
+      const team     = row.team_num ?? 0;
+      const relTick  = row.tick ?? 0;
+      const rowRound = row.total_rounds_played ?? null;
 
-      // Assigner le round via tick absolu et roundStartTicks
-      // roundStartTicks: { freezeR: startTick } — trouver le freezeR dont startTick <= absTick
+      // Convertir tick relatif → absolu via roundStartTicks
+      // parseTicks retourne des ticks RELATIFS au round (0, 16, 32...)
+      // roundStartTicks[freezeR] = tick absolu du début du round
       let assignedFreezeR = 0;
-      for (const [fr, st] of Object.entries(roundStartTicks)) {
-        const frNum = Number(fr);
-        if (st <= absTick) assignedFreezeR = frNum;
+      let absTick = relTick;
+
+      if (rowRound !== null && roundStartTicks[rowRound] !== undefined) {
+        // Utiliser total_rounds_played si disponible
+        assignedFreezeR = rowRound;
+        absTick = roundStartTicks[rowRound] + relTick;
+      } else {
+        // Fallback: trouver le round par index de séquence
+        const sortedFreezeR = Object.keys(roundStartTicks).map(Number).sort((a,b)=>a-b);
+        assignedFreezeR = sortedFreezeR[playerRowCount[name] > 0
+          ? Math.min(Math.floor((playerRowCount[name]-1) / (120974/TICK_SAMPLE/sortedFreezeR.length)), sortedFreezeR.length-1)
+          : 0] ?? 0;
+        absTick = (roundStartTicks[assignedFreezeR] ?? 0) + relTick;
       }
+
       // killsRound = assignedFreezeR + 1 (pour correspondre aux kills 1-based)
       const killsRound = assignedFreezeR + 1;
 
@@ -373,7 +385,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     });
 
     const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
-    console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
+    const sampleAbsTick = Object.values(positions)[0]?.[0]?.tick ?? 0;
+    console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total, sample absTick=${sampleAbsTick}`);
     console.log(`Joueurs dans positions: ${Object.keys(positions).join(', ')}`);
     const missing = playerNames.filter(n => !positions[n]);
     if (missing.length) {
