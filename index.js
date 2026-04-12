@@ -34,6 +34,7 @@ const upload = multer({
 });
 
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.3.0' }));
+app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
 app.post('/parse', upload.single('demo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier reçu.' });
@@ -653,4 +654,8 @@ function computeDuelZones(kills, mapName) {
   }));
 }
 
-app.listen(PORT, () => console.log(`FragValue Demo Parser CS2 v6.3 on port ${PORT}`));
+const server = app.listen(PORT, () => {
+  server.keepAliveTimeout = 620000;
+  server.headersTimeout   = 630000;
+  console.log(`FragValue Demo Parser CS2 v6.3 on port ${PORT}`);
+});
