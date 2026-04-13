@@ -207,8 +207,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       if (!rKills.length) return;
       const lastKill = rKills.reduce((a,b)=>(a.tick||0)>=(b.tick||0)?a:b);
       // CT=3 gagne si attaquant est CT, T=2 gagne si attaquant est T
-      if (lastKill.attackerTeam === 3) computedWinners[freezeR] = 2; // CT win
-      else if (lastKill.attackerTeam === 2) computedWinners[freezeR] = 3; // T win
+      if (lastKill.attackerTeam === 3) computedWinners[freezeR] = 3; // CT kills last → CT win
+      else if (lastKill.attackerTeam === 2) computedWinners[freezeR] = 2; // T kills last → T win
     });
     console.log(`Winners computed from kills: ${roundNums.slice(0,5).map(r=>`R${r}:${computedWinners[r]||0}`).join(' ')}`);
   }
@@ -586,6 +586,26 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   console.log(`Grenades: ${grenades.length}, avec détonation distincte: ${matchedDeton}`);
   if (grenades.length > 0) console.log(`Grenade[0]: tick=${grenades[0].tick} detonTick=${grenades[0].detonTick} x=${grenades[0].x} detonX=${grenades[0].detonX}`);
 
+  // ── 6b. Bomb planted events ───────────────────────────────────────────────
+  let bombPlants = [];
+  try {
+    const bombEvents = parseEvent(demoPath, 'bomb_planted', [], ['tick', 'total_rounds_played']);
+    // bomb_planted gives us the site (A or B) via the event but coordinates come from the planter
+    // We need the planter's position - use X, Y fields if available
+    bombPlants = bombEvents.map(e => {
+      const rnd = e.total_rounds_played ?? 0;
+      const relTick = e.tick ?? 0;
+      const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
+      return {
+        tick: absTick,
+        round: rnd + 1,
+        x: Math.round(e.user_X ?? e.X ?? 0),
+        y: Math.round(e.user_Y ?? e.Y ?? 0),
+      };
+    }).filter(b => b.x !== 0 || b.y !== 0);
+    console.log(`Bomb plants: ${bombPlants.length}`);
+  } catch(e) { console.warn('bomb_planted parse failed:', e.message); }
+
   // ── 7. Player stats ───────────────────────────────────────────────────────
   const statsMap = {};
   kills.forEach(k => {
@@ -622,7 +642,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   return {
     meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget },
     kills: compactKills,
-    positions, grenades: grenades.slice(0, 800), shots: shots.slice(0, 3000), rounds, roundStartTicks, playerStats, duelZones,
+    positions, grenades: grenades.slice(0, 800), shots: shots.slice(0, 3000), rounds, roundStartTicks, playerStats, duelZones, bombPlants,
   };
 }
 
