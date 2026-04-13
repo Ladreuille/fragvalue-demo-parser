@@ -242,8 +242,9 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   const { parseTicks } = require('@laihoe/demoparser2');
   let positions = {};
-  const TICK_SAMPLE = 16; // 1 tick sur 16 → ~4-8fps positions, mouvements fluides
-  // ~75000 pts total ≈ 1.5MB JSON → bien sous la limite sessionStorage
+  const TICK_SAMPLE = 32; // 1 tick sur 32 → ~4fps positions, fluide avec interpolation
+  // Noms compacts : x,y,t(team),r(round),k(tick),h(hp),w(weapon),a(armor),he(helmet),d(defuser),m(money)
+  // ~35000 pts * ~100 bytes ≈ 3.5MB JSON → sous la limite sessionStorage 5MB
 
   try {
     const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'health', 'armor_value', 'has_helmet', 'has_defuser', 'active_weapon_name', 'balance']);
@@ -354,33 +355,31 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       positions[name].push({
         x: Math.round(x),
         y: Math.round(y),
-        team,
-        round: killsRound,
-        tick:  absTick,
-        hp: row.health ?? 100,
-        weapon: row.active_weapon_name || null,
-        armor: row.armor_value ?? 0,
-        hasHelmet: !!row.has_helmet,
-        hasDefuser: !!row.has_defuser,
-        money: row.balance ?? 0,
+        t: team,
+        r: killsRound,
+        k: absTick,
+        h: row.health ?? 100,
+        w: row.active_weapon_name || null,
+        a: row.armor_value ?? 0,
+        he: row.has_helmet ? 1 : 0,
+        d: row.has_defuser ? 1 : 0,
+        m: row.balance ?? 0,
       });
     });
 
     // Tri par tick absolu (le round est déjà assigné correctement)
     Object.keys(positions).forEach(name => {
-      positions[name].sort((a, b) => a.tick - b.tick);
+      positions[name].sort((a, b) => a.k - b.k);
     });
 
     const totalPos = Object.values(positions).reduce((s, v) => s + v.length, 0);
-    const sampleAbsTick0 = Object.values(positions)[0]?.[0]?.tick ?? 0;
-    const sampleAbsTick1 = Object.values(positions)[0]?.find(p=>p.round===2)?.tick ?? 0;
     const p0 = Object.values(positions)[0] || [];
     console.log(`Positions parseTicks: ${Object.keys(positions).length} joueurs, ${totalPos} pts total`);
-    console.log(`Tick samples: [${p0.slice(0,5).map(p=>p.tick).join(',')}]`);
-    console.log(`Round samples: [${p0.slice(0,5).map(p=>p.round).join(',')}]`);
+    console.log(`Tick samples: [${p0.slice(0,5).map(p=>p.k).join(',')}]`);
+    console.log(`Round samples: [${p0.slice(0,5).map(p=>p.r).join(',')}]`);
     // Compter combien de positions par round
     const rndCounts = {};
-    p0.forEach(p => { rndCounts[p.round] = (rndCounts[p.round]||0)+1; });
+    p0.forEach(p => { rndCounts[p.r] = (rndCounts[p.r]||0)+1; });
     console.log(`Positions par round: ${JSON.stringify(rndCounts)}`);
     console.log(`Joueurs dans positions: ${Object.keys(positions).join(', ')}`);
     const missing = playerNames.filter(n => !positions[n]);
