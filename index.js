@@ -246,7 +246,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   // ~75000 pts total ≈ 1.5MB JSON → bien sous la limite sessionStorage
 
   try {
-    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'health', 'armor_value', 'has_helmet', 'has_defuser', 'active_weapon_name']);
+    const tickData = parseTicks(demoPath, ['X', 'Y', 'team_num', 'health', 'armor_value', 'has_helmet', 'has_defuser', 'active_weapon_name', 'balance']);
     // On assigne le round via les limites de ticks cumulatifs
     console.log(`parseTicks raw rows: ${tickData.length}`);
     if (tickData.length > 0) {
@@ -362,6 +362,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         armor: row.armor_value ?? 0,
         hasHelmet: !!row.has_helmet,
         hasDefuser: !!row.has_defuser,
+        money: row.balance ?? 0,
       });
     });
 
