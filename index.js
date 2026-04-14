@@ -185,13 +185,15 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   console.log(`Round nums from freeze_end: ${roundNums.join(',')}`);
 
   // Detection des knife rounds basee sur les armes utilisees
-  // On ne force PAS round 0 = knife, on verifie les kills reels
+  // FACEIT demos : round 0 est toujours le knife round
+  // Si aucun kill dans le round, round 0 = knife par defaut
   const knifeRounds = new Set();
   roundNums.forEach(freezeR => {
     const killsR = freezeR + 1;
     const rKills = kills.filter(k => k.round === killsR);
     if (rKills.length === 0) {
-      // Pas de kills dans ce round - pas assez de donnees pour confirmer knife
+      // Pas de kills : round 0 = knife round (FACEIT standard)
+      if (freezeR === roundNums[0]) knifeRounds.add(freezeR);
       return;
     }
     const allKnife = rKills.every(k => {
@@ -217,6 +219,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     console.log(`Winners computed from kills: ${roundNums.slice(0,5).map(r=>`R${r}:${computedWinners[r]||0}`).join(' ')}`);
   }
 
+  let displayCounter = 0;
   const rounds = roundNums.map((freezeR, i) => {
     const startTick = roundStartTicks[freezeR] ?? 0;
     // endTick = startTick du round suivant (source la plus fiable)
@@ -224,14 +227,16 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const endTick = nextFreezeR !== undefined
       ? (roundStartTicks[nextFreezeR] ?? 0) - 1
       : startTick + 15000; // dernier round : estimer ~2min max
+    const isKnife = knifeRounds.has(freezeR);
+    if (!isKnife) displayCounter++;
     return {
       round:      freezeR,
       killsRound: freezeR + 1,
-      displayNum: i + 1,
+      displayNum: isKnife ? 0 : displayCounter,
       winner:     computedWinners[freezeR] ?? 0,
       startTick,
       endTick,
-      isKnife:    knifeRounds.has(freezeR),
+      isKnife,
     };
   });
 
