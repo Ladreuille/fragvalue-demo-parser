@@ -40,14 +40,19 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier reçu.' });
   const demoPath     = req.file.path;
   const targetPlayer = req.body.player || null;
-  console.log(`Parsing: ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(1)} MB)`);
+  const sizeMB = (req.file.size/1024/1024).toFixed(1);
+  console.log(`Parsing: ${req.file.originalname} (${sizeMB} MB)`);
+
+  // Timeout long pour gros fichiers (5 min)
+  req.setTimeout(300000);
   res.setTimeout(300000);
+
   try {
     const result = await parseCS2Demo(demoPath, targetPlayer, req.file.originalname || '');
     res.json({ success: true, data: result });
   } catch (err) {
     console.error('Parse error:', err.message);
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   } finally {
     fs.unlink(demoPath, () => {});
   }
