@@ -3,7 +3,7 @@ const multer  = require('multer');
 const cors    = require('cors');
 const fs      = require('fs');
 const os      = require('os');
-const { parseEvent, parsePlayerInfo } = require('@laihoe/demoparser2');
+const { parseEvent, parsePlayerInfo, parseGrenades } = require('@laihoe/demoparser2');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -491,12 +491,13 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       }
       const tSid = e.user_steamid != null ? String(e.user_steamid) : null;
       return {
-        tick:    absTick,
-        type:    e.weapon,
-        thrower: (tSid && sidToName[tSid]) || e.user_name || e.user || 'Unknown',
-        team:    e.user_team_num ?? 0,
-        x:       Math.round(e.user_X ?? 0),
-        y:       Math.round(e.user_Y ?? 0),
+        tick:      absTick,
+        type:      e.weapon,
+        thrower:   (tSid && sidToName[tSid]) || e.user_name || e.user || 'Unknown',
+        throwerSid: tSid,
+        team:      e.user_team_num ?? 0,
+        x:         Math.round(e.user_X ?? 0),
+        y:         Math.round(e.user_Y ?? 0),
       };
     });
 
@@ -597,15 +598,16 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         : 128;
 
       return {
-        tick:      g.tick,
+        tick:       g.tick,
         detonTick,
-        endTick:   detonTick + duration,
-        type:      g.type,
-        thrower:   g.thrower,
-        team:      g.team,
-        x:         g.x,       // position du lanceur
-        y:         g.y,
-        detonX,               // position d'explosion
+        endTick:    detonTick + duration,
+        type:       g.type,
+        thrower:    g.thrower,
+        throwerSid: g.throwerSid,
+        team:       g.team,
+        x:          g.x,       // position du lanceur
+        y:          g.y,
+        detonX,                // position d'explosion
         detonY,
       };
     });
@@ -638,6 +640,97 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   const matchedDeton = grenades.filter(g => g.detonX !== g.x || g.detonY !== g.y).length;
   console.log(`Grenades: ${grenades.length}, avec détonation distincte: ${matchedDeton}`);
   if (grenades.length > 0) console.log(`Grenade[0]: tick=${grenades[0].tick} detonTick=${grenades[0].detonTick} x=${grenades[0].x} detonX=${grenades[0].detonX}`);
+
+  // ── 6b. Grenade trajectories (per-tick positions for realistic bouncing) ──
+  // parseGrenades returns one row per tick while a grenade entity is in flight,
+  // including bounces off walls/floors. We attach `path` (flat [x1,y1,x2,y2,...])
+  // to each existing grenade by matching thrower steamid + tick proximity.
+  try {
+    const gData = parseGrenades(demoPath) || [];
+    console.log(`parseGrenades: ${gData.length} trajectory rows`);
+    if (gData.length > 0) {
+      console.log(`parseGrenades sample keys: ${Object.keys(gData[0]).join(', ')}`);
+      // Group by entity_id
+      const byEntity = {};
+      gData.forEach(p => {
+        const eid = p.entity_id;
+        if (eid == null) return;
+        if (!byEntity[eid]) byEntity[eid] = [];
+        byEntity[eid].push(p);
+      });
+      const groups = [];
+      Object.entries(byEntity).forEach(([eid, arr]) => {
+        arr.sort((a, b) => (a.tick || 0) - (b.tick || 0));
+        const first = arr[0];
+        const last  = arr[arr.length - 1];
+        groups.push({
+          eid,
+          thrower:   first?.thrower_steamid != null ? String(first.thrower_steamid) : null,
+          name:      first?.name || first?.grenade_type || '',
+          startTick: first?.tick ?? 0,
+          endTick:   last?.tick ?? 0,
+          points:    arr,
+          _used:     false,
+        });
+      });
+      console.log(`parseGrenades groups: ${groups.length} (by entity_id)`);
+
+      // Match to existing grenades: same thrower, startTick within [−16, +192]
+      // of the throw event, prefer smallest |diff|.
+      let matched = 0, noSidSkipped = 0;
+      grenades.forEach(g => {
+        if (!g.throwerSid) { noSidSkipped++; return; }
+        let best = null, bestAbs = Infinity;
+        groups.forEach(grp => {
+          if (grp._used) return;
+          if (grp.thrower !== g.throwerSid) return;
+          const diff = grp.startTick - g.tick;
+          if (diff < -16 || diff > 192) return;
+          const ad = Math.abs(diff);
+          if (ad < bestAbs) { bestAbs = ad; best = grp; }
+        });
+        if (!best) return;
+        best._used = true;
+        matched++;
+
+        // Downsample to ≤ 24 points to keep payload compact.
+        const pts = best.points;
+        const maxPts = 24;
+        const step = Math.max(1, Math.floor(pts.length / maxPts));
+        const path = [];
+        for (let i = 0; i < pts.length; i += step) {
+          path.push(Math.round(pts[i].X || 0), Math.round(pts[i].Y || 0));
+        }
+        // Always include the last trajectory point for accurate landing spot.
+        const last = pts[pts.length - 1];
+        if (last) {
+          const lx = Math.round(last.X || 0), ly = Math.round(last.Y || 0);
+          const pLastX = path[path.length - 2], pLastY = path[path.length - 1];
+          if (lx !== pLastX || ly !== pLastY) path.push(lx, ly);
+        }
+        g.path = path;
+
+        // The trajectory end is the true landing/detonation spot. Prefer it
+        // over the event-based estimate when available.
+        if (best.endTick > g.tick) {
+          const durationBefore = (g.endTick || 0) - (g.detonTick || 0);
+          g.detonTick = best.endTick;
+          g.endTick   = best.endTick + durationBefore;
+          if (last) {
+            g.detonX = Math.round(last.X || 0);
+            g.detonY = Math.round(last.Y || 0);
+          }
+        }
+      });
+      console.log(`Grenade paths attached: ${matched}/${grenades.length} (${noSidSkipped} without sid)`);
+      if (matched > 0) {
+        const sampleG = grenades.find(g => g.path && g.path.length >= 4);
+        if (sampleG) console.log(`Grenade path sample: type=${sampleG.type} tick=${sampleG.tick} detonTick=${sampleG.detonTick} pts=${sampleG.path.length/2}`);
+      }
+    }
+  } catch(e) {
+    console.warn('parseGrenades failed:', e.message);
+  }
 
   // ── 6b. Bomb planted events ───────────────────────────────────────────────
   let bombPlants = [];
