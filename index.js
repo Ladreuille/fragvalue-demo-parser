@@ -489,20 +489,14 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     if (gEvents.length > 0) {
       console.log(`weapon_fire sample keys: ${Object.keys(gEvents[0]).join(', ')}`);
     }
+    // weapon_fire `tick` is ABSOLUTE in demoparser2 0.41.x — do NOT shift
+    // it with roundStartTicks. Previously we were double-counting, which
+    // broke grenade→trajectory matching (fire ticks were ~5000 ticks ahead
+    // of actual, so no trajectory fell within the [-64, +512] window).
     const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => {
-      const relTick = e.tick ?? 0;
-      let absTick = relTick;
-      if (relTick < 10000 && relTick > 0) {
-        // Relatif — ajouter le startTick du round le plus récent avant ce tick
-        const sortedRounds = Object.entries(roundStartTicks)
-          .map(([r,st]) => ({r:Number(r), st:Number(st)}))
-          .filter(({st}) => st > 0)
-          .sort((a,b) => a.st - b.st);
-        if (sortedRounds.length) absTick = sortedRounds[sortedRounds.length-1].st + relTick;
-      }
       const tSid = e.user_steamid != null ? String(e.user_steamid) : null;
       return {
-        tick:      absTick,
+        tick:      e.tick ?? 0, // already absolute
         type:      e.weapon,
         thrower:   (tSid && sidToName[tSid]) || e.user_name || e.user || 'Unknown',
         throwerSid: tSid,
@@ -533,24 +527,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         }
         evs.forEach(e => {
           if (!detonations[key]) detonations[key] = [];
-          const ex = e.x ?? e.X ?? e.user_X ?? 0;
-          const ey = e.y ?? e.Y ?? e.user_Y ?? 0;
-          const dt = e.tick ?? 0;
-          // Trouver le tick absolu : chercher le roundStartTick dont start <= dt
-          // Si dt > 10000, déjà absolu
-          let absDetTick = dt;
-          if (dt < 10000 && dt > 0) {
-            // Relatif — trouver le bon round via les roundStartTicks
-            const sortedRounds = Object.entries(roundStartTicks)
-              .map(([r,st]) => ({r:Number(r), st:Number(st)}))
-              .sort((a,b) => a.st - b.st);
-            // Chercher le round dont on est dans la durée
-            for (let ri = sortedRounds.length-1; ri >= 0; ri--) {
-              const {r, st} = sortedRounds[ri];
-              if (st > 0) { absDetTick = st + dt; break; }
-            }
-          }
-          // Les coords sont dans e.x, e.y (other props) selon les logs
+          // Detonation event `tick` is also ABSOLUTE in demoparser2 0.41.x.
+          const absDetTick = e.tick ?? 0;
           const ex2 = e.x ?? e.X ?? e.user_X ?? 0;
           const ey2 = e.y ?? e.Y ?? e.user_Y ?? 0;
           detonations[key].push({ tick: absDetTick, x: Math.round(ex2), y: Math.round(ey2) });
@@ -623,21 +601,12 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       };
     });
 
-    // Tirs séparément pour avoir le tick absolu
-    // On mappe chaque tir sur le tick absolu via roundStartTicks
+    // Tirs (gun shots): weapon_fire `tick` is ABSOLUTE already — do not shift.
     const shootEvents = gEvents.filter(e => !grenadeTypes.has(e.weapon));
     shots = shootEvents.map(e => {
-      // Trouver le tick absolu : e.tick est relatif au round
-      // On cherche le roundStartTick correspondant au round du tir
-      const relTick = e.tick ?? 0;
-      // Trouver le freezeR dont le startTick <= tick absolu estimé
-      // Heuristique : le tick absolu = relTick + roundStartTick[freezeR]
-      // On trouve le bon round en cherchant dans roundStartTicks
-      const rnd = e.total_rounds_played ?? 0;
-      const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
       const sSid = e.user_steamid != null ? String(e.user_steamid) : null;
       return {
-        tick:    absTick,
+        tick:    e.tick ?? 0, // already absolute
         shooter: (sSid && sidToName[sSid]) || e.user_name || e.user || 'Unknown',
         team:    e.user_team_num ?? 0,
         x:       Math.round(e.user_X ?? e.X ?? 0),
@@ -653,70 +622,137 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   if (grenades.length > 0) console.log(`Grenade[0]: tick=${grenades[0].tick} detonTick=${grenades[0].detonTick} x=${grenades[0].x} detonX=${grenades[0].detonX}`);
 
   // ── 6b. Grenade trajectories (per-tick positions for realistic bouncing) ──
-  // parseGrenades returns one row per tick while a grenade entity is in flight,
-  // including bounces off walls/floors. We attach `path` (flat [x1,y1,x2,y2,...])
-  // to each existing grenade by matching thrower steamid + tick proximity.
+  // parseGrenades returns one row per tick per projectile. CRITICAL: pass
+  // `grenades: false` (3rd arg) so we only get PROJECTILE rows (grenade in
+  // flight) with populated coordinates — the default `true` also includes
+  // held grenades with null x/y, bloating the response 10x with useless data.
+  // Returned row keys: grenade_entity_id, grenade_type, name, steamid,
+  // tick, x, y, z (all lowercase). Trajectories include bounces off walls
+  // and floors — exactly what the frontend needs to render realistic paths.
   try {
-    const gData = parseGrenades(demoPath) || [];
-    console.log(`parseGrenades: ${gData.length} trajectory rows`);
+    const gData = parseGrenades(demoPath, [], false) || [];
+    console.log(`parseGrenades: ${gData.length} projectile trajectory rows`);
     if (gData.length > 0) {
       console.log(`parseGrenades sample keys: ${Object.keys(gData[0]).join(', ')}`);
-      // Group by entity_id
+      console.log(`parseGrenades sample row: ${JSON.stringify(gData[0])}`);
+
+      // Group by grenade_entity_id — BUT the demo engine reuses entity slots
+      // across the whole match once a grenade is destroyed. So a single eid
+      // like "66" can correspond to dozens of different grenades over the
+      // course of the match. We split into sub-groups whenever the tick gap
+      // between consecutive rows exceeds `GAP_SPLIT` ticks (2 seconds), which
+      // is much larger than any tick interval within a single grenade's
+      // lifetime (rows are emitted every tick while the projectile is live).
+      const GAP_SPLIT = 128; // 2 s at 64 tps — safe, well above intra-grenade gaps
       const byEntity = {};
       gData.forEach(p => {
-        const eid = p.entity_id;
+        const eid = p.grenade_entity_id;
         if (eid == null) return;
+        if (p.x == null || p.y == null) return;
         if (!byEntity[eid]) byEntity[eid] = [];
         byEntity[eid].push(p);
       });
       const groups = [];
       Object.entries(byEntity).forEach(([eid, arr]) => {
         arr.sort((a, b) => (a.tick || 0) - (b.tick || 0));
-        const first = arr[0];
-        const last  = arr[arr.length - 1];
-        groups.push({
-          eid,
-          thrower:   first?.thrower_steamid != null ? String(first.thrower_steamid) : null,
-          name:      first?.name || first?.grenade_type || '',
-          startTick: first?.tick ?? 0,
-          endTick:   last?.tick ?? 0,
-          points:    arr,
-          _used:     false,
-        });
+        // Walk the entity's row stream, starting a new sub-group every time
+        // the gap from the previous row exceeds GAP_SPLIT. Each sub-group
+        // is ONE physical grenade throw.
+        let currentArr = [];
+        let lastTick = -Infinity;
+        const flush = () => {
+          if (currentArr.length === 0) return;
+          const first = currentArr[0];
+          const last  = currentArr[currentArr.length - 1];
+          groups.push({
+            eid,
+            thrower:   first?.steamid != null ? String(first.steamid) : null,
+            name:      first?.name || '',
+            gtype:     first?.grenade_type || '',
+            startTick: first?.tick ?? 0,
+            endTick:   last?.tick ?? 0,
+            points:    currentArr,
+            _used:     false,
+          });
+          currentArr = [];
+        };
+        for (const row of arr) {
+          const t = row.tick ?? 0;
+          if (t - lastTick > GAP_SPLIT) flush();
+          currentArr.push(row);
+          lastTick = t;
+        }
+        flush();
       });
-      console.log(`parseGrenades groups: ${groups.length} (by entity_id)`);
+      console.log(`parseGrenades groups: ${groups.length} (by grenade_entity_id + gap-split)`);
+      if (groups.length > 0) {
+        const g0 = groups[0];
+        console.log(`Group[0]: eid=${g0.eid} type=${g0.gtype} thrower=${g0.thrower} startTick=${g0.startTick} endTick=${g0.endTick} pts=${g0.points.length}`);
+      }
 
       // Helper: attach trajectory group to a grenade object.
+      // CRITICAL: we only want the FLIGHT segment of the trajectory, not the
+      // full entity lifecycle. For smokes/molotovs, the entity persists after
+      // detonation (smoke cloud for 18s, fire for 7s), so parseGrenades keeps
+      // emitting rows at the stationary final position. We detect "landed" by
+      // finding the first point where velocity drops below a small threshold
+      // for N consecutive ticks, and cut the path there.
       const attachPath = (g, grp) => {
         grp._used = true;
-        const pts = grp.points;
-        const maxPts = 24;
+        const rawPts = grp.points;
+        // Find landing tick: first run of 6+ consecutive rows where position
+        // moved < 5 units per tick. 5 units/tick ≈ very slow rolling.
+        let landIdx = rawPts.length - 1;
+        const STILL_THRESHOLD = 5;
+        const STILL_RUN = 6;
+        let stillCount = 0;
+        for (let i = 1; i < rawPts.length; i++) {
+          const pa = rawPts[i - 1], pb = rawPts[i];
+          if (pa.x == null || pb.x == null) { stillCount = 0; continue; }
+          const dx = pb.x - pa.x, dy = pb.y - pa.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < STILL_THRESHOLD * STILL_THRESHOLD) {
+            stillCount++;
+            if (stillCount >= STILL_RUN) { landIdx = i - STILL_RUN + 1; break; }
+          } else {
+            stillCount = 0;
+          }
+        }
+        const pts = rawPts.slice(0, Math.max(2, landIdx + 1));
+        const flightEndTick = pts[pts.length - 1]?.tick ?? grp.endTick;
+
+        // Downsample flight pts to <=32 waypoints.
+        const maxPts = 32;
         const step = Math.max(1, Math.floor(pts.length / maxPts));
         const path = [];
         for (let i = 0; i < pts.length; i += step) {
-          path.push(Math.round(pts[i].X || 0), Math.round(pts[i].Y || 0));
+          const px = pts[i].x, py = pts[i].y;
+          if (px == null || py == null) continue;
+          path.push(Math.round(px), Math.round(py));
         }
         const last = pts[pts.length - 1];
-        if (last) {
-          const lx = Math.round(last.X || 0), ly = Math.round(last.Y || 0);
+        if (last && last.x != null && last.y != null) {
+          const lx = Math.round(last.x), ly = Math.round(last.y);
           const pLastX = path[path.length - 2], pLastY = path[path.length - 1];
           if (lx !== pLastX || ly !== pLastY) path.push(lx, ly);
         }
         g.path = path;
-        if (grp.endTick > g.tick) {
-          const durationBefore = (g.endTick || 0) - (g.detonTick || 0);
-          g.detonTick = grp.endTick;
-          g.endTick   = grp.endTick + durationBefore;
-          if (last) {
-            g.detonX = Math.round(last.X || 0);
-            g.detonY = Math.round(last.Y || 0);
-          }
+
+        // Update detonation tick/position from real landing point.
+        // Preserve the existing effect duration (2304 for smoke, etc.).
+        const effectDuration = Math.max(0, (g.endTick || 0) - (g.detonTick || 0));
+        g.detonTick = flightEndTick;
+        g.endTick   = flightEndTick + effectDuration;
+        if (last && last.x != null && last.y != null) {
+          g.detonX = Math.round(last.x);
+          g.detonY = Math.round(last.y);
         }
       };
 
       // Pass 1: match by thrower steamid + tick proximity (best signal).
       // Wide tick window (−64 to +512) because weapon_fire tick and the first
-      // trajectory tick are sometimes offset by bookkeeping delays.
+      // trajectory tick are offset by the throw animation (~20-40 ticks for
+      // a jump-throw), and detonation can be up to 8s later for cooked HE.
       let matchedSid = 0, noSidSkipped = 0;
       grenades.forEach(g => {
         if (!g.throwerSid) { noSidSkipped++; return; }
@@ -744,11 +780,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
           const diff = grp.startTick - g.tick;
           if (diff < -64 || diff > 512) return;
           const first = grp.points[0];
-          if (!first) return;
-          const dx = (first.X || 0) - g.x;
-          const dy = (first.Y || 0) - g.y;
+          if (!first || first.x == null || first.y == null) return;
+          const dx = first.x - g.x;
+          const dy = first.y - g.y;
           const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist > 200) return; // throw origin must be within 200 units
+          if (dist > 250) return; // throw origin must be within 250 units
           const score = dist + Math.abs(diff) * 0.5;
           if (score < bestScore) { bestScore = score; best = grp; }
         });
@@ -759,11 +795,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       console.log(`Grenade paths: sid-matched=${matchedSid}, pos-matched=${matchedPos}, total=${matched}/${grenades.length} (${noSidSkipped} no-sid)`);
       if (matched > 0) {
         const sampleG = grenades.find(g => g.path && g.path.length >= 4);
-        if (sampleG) console.log(`Grenade path sample: type=${sampleG.type} tick=${sampleG.tick} detonTick=${sampleG.detonTick} pts=${sampleG.path.length/2}`);
+        if (sampleG) console.log(`Grenade path sample: type=${sampleG.type} tick=${sampleG.tick} detonTick=${sampleG.detonTick} pts=${sampleG.path.length/2} path=[${sampleG.path.slice(0,10).join(',')}...]`);
       }
     }
   } catch(e) {
-    console.warn('parseGrenades failed:', e.message);
+    console.warn('parseGrenades failed:', e.message, e.stack);
   }
 
   // ── 6b. Bomb planted events ───────────────────────────────────────────────
@@ -774,10 +810,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     // We need the planter's position - use X, Y fields if available
     bombPlants = bombEvents.map(e => {
       const rnd = e.total_rounds_played ?? 0;
-      const relTick = e.tick ?? 0;
-      const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
       return {
-        tick: absTick,
+        tick: e.tick ?? 0, // already absolute
         round: rnd + 1,
         x: Math.round(e.user_X ?? e.X ?? 0),
         y: Math.round(e.user_Y ?? e.Y ?? 0),
