@@ -258,6 +258,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   const { parseTicks } = require('@laihoe/demoparser2');
   let positions = {};
+  // Hoist sidToName so later blocks (grenades, shots) can look up names by sid.
+  let sidToName = {};
   const TICK_SAMPLE = 32; // 1 tick sur 32 → ~4fps positions, fluide avec interpolation
   // Noms compacts : x,y,t(team),r(round),k(tick),h(hp),w(weapon),a(armor),he(helmet),d(defuser),m(money)
   // ~35000 pts * ~100 bytes ≈ 3.5MB JSON → sous la limite sessionStorage 5MB
@@ -295,8 +297,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const firstRow = tickData[0];
     console.log('parseTicks row[0] steamid:', firstRow?.steamid, 'type:', typeof firstRow?.steamid, 'BigInt?', typeof firstRow?.steamid === 'bigint');
 
-    // Construire sidToName en gérant BigInt
-    const sidToName = {};
+    // Construire sidToName en gérant BigInt (hoisted au scope de la fonction)
     // steamToName a des string keys
     Object.entries(steamToName).forEach(([k,v]) => { sidToName[k] = v; });
     // parseTicks peut avoir des BigInt steamids
