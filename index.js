@@ -79,11 +79,13 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     round:        e.total_rounds_played ?? 0,
     tick:         e.tick ?? 0,
     attacker:     e.attacker_name  || e.attacker || 'Unknown',
+    attackerSid:  e.attacker_steamid != null ? String(e.attacker_steamid) : null,
     attackerTeam: e.attacker_team_num ?? 0,
     attackerX:    e.attacker_X ?? 0,
     attackerY:    e.attacker_Y ?? 0,
     attackerZ:    e.attacker_Z ?? 0,
     victim:       e.user_name || e.user || 'Unknown',
+    victimSid:    e.user_steamid != null ? String(e.user_steamid) : null,
     victimTeam:   e.user_team_num ?? 0,
     victimX:      e.user_X ?? 0,
     victimY:      e.user_Y ?? 0,
@@ -311,6 +313,39 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     });
     console.log(`sidToName resolved (${Object.keys(sidToName).length}): ${Object.values(sidToName).join(', ')}`);
 
+    // ── Desambiguation des collisions de noms ───────────────────────────────
+    // parseTicks emit une row par (sid, tick). Si 2 sids partagent le meme
+    // display name, sidToName[sidA] === sidToName[sidB] : leurs samples
+    // fusionnent sous la meme cle dans `positions`, et `playerRowCount[name]`
+    // est incremente par les deux, doublant la frequence d'echantillonnage
+    // et produisant des trails qui sautent entre les 2 joueurs (bug replay).
+    // Fix : suffixer chaque sid en collision avec ses 4 derniers digits, puis
+    // remapper les noms deja figes dans `kills` via leur sid stocke plus haut.
+    const nameToSids = {};
+    Object.entries(sidToName).forEach(([sid, nm]) => {
+      if (!nameToSids[nm]) nameToSids[nm] = [];
+      nameToSids[nm].push(sid);
+    });
+    const collisions = Object.entries(nameToSids).filter(([, sids]) => sids.length > 1);
+    if (collisions.length > 0) {
+      console.warn(`Name collisions detected: ${collisions.map(([nm, sids]) => `"${nm}"x${sids.length}`).join(', ')}`);
+      collisions.forEach(([nm, sids]) => {
+        sids.forEach(sid => {
+          sidToName[sid] = `${nm}#${String(sid).slice(-4)}`;
+        });
+      });
+      // steamToName mirror (utilise par les fallbacks ailleurs)
+      Object.keys(steamToName).forEach(sid => {
+        if (sidToName[sid]) steamToName[sid] = sidToName[sid];
+      });
+      // Remap les kills deja construits via leur sid stocke
+      kills.forEach(k => {
+        if (k.attackerSid && sidToName[k.attackerSid]) k.attacker = sidToName[k.attackerSid];
+        if (k.victimSid   && sidToName[k.victimSid])   k.victim   = sidToName[k.victimSid];
+      });
+      console.log(`Noms apres desambiguation: ${Object.values(sidToName).join(', ')}`);
+    }
+
     // Debug : compter rows par joueur avant filtrage
     const rowCountBySid = {};
     const validCoordBySid = {};
@@ -453,10 +488,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
           .sort((a,b) => a.st - b.st);
         if (sortedRounds.length) absTick = sortedRounds[sortedRounds.length-1].st + relTick;
       }
+      const tSid = e.user_steamid != null ? String(e.user_steamid) : null;
       return {
         tick:    absTick,
         type:    e.weapon,
-        thrower: e.user_name || e.user || 'Unknown',
+        thrower: (tSid && sidToName[tSid]) || e.user_name || e.user || 'Unknown',
         team:    e.user_team_num ?? 0,
         x:       Math.round(e.user_X ?? 0),
         y:       Math.round(e.user_Y ?? 0),
@@ -585,9 +621,10 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       // On trouve le bon round en cherchant dans roundStartTicks
       const rnd = e.total_rounds_played ?? 0;
       const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
+      const sSid = e.user_steamid != null ? String(e.user_steamid) : null;
       return {
         tick:    absTick,
-        shooter: e.user_name || e.user || 'Unknown',
+        shooter: (sSid && sidToName[sSid]) || e.user_name || e.user || 'Unknown',
         team:    e.user_team_num ?? 0,
         x:       Math.round(e.user_X ?? e.X ?? 0),
         y:       Math.round(e.user_Y ?? e.Y ?? 0),
