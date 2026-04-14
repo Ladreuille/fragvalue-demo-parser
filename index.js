@@ -184,19 +184,23 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   const roundNums = Object.keys(roundStartTicks).map(Number).sort((a,b)=>a-b);
   console.log(`Round nums from freeze_end: ${roundNums.join(',')}`);
 
-  // Le round 0 (freezeR=0) est TOUJOURS le knife round en CS2 compétitif
-  const knifeRounds = new Set([0]);
-  // Vérifier aussi les autres rounds (kills couteau)
+  // Detection des knife rounds basee sur les armes utilisees
+  // On ne force PAS round 0 = knife, on verifie les kills reels
+  const knifeRounds = new Set();
   roundNums.forEach(freezeR => {
-    if (freezeR === 0) return; // déjà ajouté
     const killsR = freezeR + 1;
     const rKills = kills.filter(k => k.round === killsR);
-    if (rKills.length > 0) {
-      const knifeK = rKills.filter(k => k.weapon && (k.weapon.includes('knife') || k.weapon.includes('bayonet')));
-      if (knifeK.length / rKills.length > 0.5) knifeRounds.add(freezeR);
+    if (rKills.length === 0) {
+      // Pas de kills dans ce round - pas assez de donnees pour confirmer knife
+      return;
     }
+    const allKnife = rKills.every(k => {
+      const w = (k.weapon || '').toLowerCase();
+      return w.includes('knife') || w.includes('bayonet') || w.includes('melee') || w.includes('fists');
+    });
+    if (allKnife) knifeRounds.add(freezeR);
   });
-  console.log(`Knife rounds detected (freeze nums): ${[...knifeRounds].join(',')}`);
+  console.log(`Knife rounds detected (freeze nums): ${[...knifeRounds].join(',') || 'none'}`);
 
   // Déduire winner depuis le dernier kill du round si round_announce_win absent
   const computedWinners = {...roundWinners};
