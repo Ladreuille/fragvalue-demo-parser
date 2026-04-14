@@ -477,7 +477,18 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade','weapon_decoy']);
     
     // Lancer de grenade (position du lanceur + tick absolu)
-    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick', 'total_rounds_played']);
+    // IMPORTANT: explicitly request `steamid` and `name` in playerProps —
+    // recent demoparser2 versions do not auto-populate them, so without this
+    // `e.user_steamid` is undefined and our grenade→trajectory matching fails.
+    const gEvents = parseEvent(
+      demoPath,
+      'weapon_fire',
+      ['X', 'Y', 'Z', 'team_num', 'steamid', 'name'],
+      ['weapon', 'tick', 'total_rounds_played']
+    );
+    if (gEvents.length > 0) {
+      console.log(`weapon_fire sample keys: ${Object.keys(gEvents[0]).join(', ')}`);
+    }
     const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => {
       const relTick = e.tick ?? 0;
       let absTick = relTick;
@@ -675,33 +686,16 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       });
       console.log(`parseGrenades groups: ${groups.length} (by entity_id)`);
 
-      // Match to existing grenades: same thrower, startTick within [−16, +192]
-      // of the throw event, prefer smallest |diff|.
-      let matched = 0, noSidSkipped = 0;
-      grenades.forEach(g => {
-        if (!g.throwerSid) { noSidSkipped++; return; }
-        let best = null, bestAbs = Infinity;
-        groups.forEach(grp => {
-          if (grp._used) return;
-          if (grp.thrower !== g.throwerSid) return;
-          const diff = grp.startTick - g.tick;
-          if (diff < -16 || diff > 192) return;
-          const ad = Math.abs(diff);
-          if (ad < bestAbs) { bestAbs = ad; best = grp; }
-        });
-        if (!best) return;
-        best._used = true;
-        matched++;
-
-        // Downsample to ≤ 24 points to keep payload compact.
-        const pts = best.points;
+      // Helper: attach trajectory group to a grenade object.
+      const attachPath = (g, grp) => {
+        grp._used = true;
+        const pts = grp.points;
         const maxPts = 24;
         const step = Math.max(1, Math.floor(pts.length / maxPts));
         const path = [];
         for (let i = 0; i < pts.length; i += step) {
           path.push(Math.round(pts[i].X || 0), Math.round(pts[i].Y || 0));
         }
-        // Always include the last trajectory point for accurate landing spot.
         const last = pts[pts.length - 1];
         if (last) {
           const lx = Math.round(last.X || 0), ly = Math.round(last.Y || 0);
@@ -709,20 +703,60 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
           if (lx !== pLastX || ly !== pLastY) path.push(lx, ly);
         }
         g.path = path;
-
-        // The trajectory end is the true landing/detonation spot. Prefer it
-        // over the event-based estimate when available.
-        if (best.endTick > g.tick) {
+        if (grp.endTick > g.tick) {
           const durationBefore = (g.endTick || 0) - (g.detonTick || 0);
-          g.detonTick = best.endTick;
-          g.endTick   = best.endTick + durationBefore;
+          g.detonTick = grp.endTick;
+          g.endTick   = grp.endTick + durationBefore;
           if (last) {
             g.detonX = Math.round(last.X || 0);
             g.detonY = Math.round(last.Y || 0);
           }
         }
+      };
+
+      // Pass 1: match by thrower steamid + tick proximity (best signal).
+      // Wide tick window (−64 to +512) because weapon_fire tick and the first
+      // trajectory tick are sometimes offset by bookkeeping delays.
+      let matchedSid = 0, noSidSkipped = 0;
+      grenades.forEach(g => {
+        if (!g.throwerSid) { noSidSkipped++; return; }
+        let best = null, bestAbs = Infinity;
+        groups.forEach(grp => {
+          if (grp._used) return;
+          if (grp.thrower !== g.throwerSid) return;
+          const diff = grp.startTick - g.tick;
+          if (diff < -64 || diff > 512) return;
+          const ad = Math.abs(diff);
+          if (ad < bestAbs) { bestAbs = ad; best = grp; }
+        });
+        if (best) { attachPath(g, best); matchedSid++; }
       });
-      console.log(`Grenade paths attached: ${matched}/${grenades.length} (${noSidSkipped} without sid)`);
+
+      // Pass 2: fallback match by thrower position + tick proximity for
+      // grenades that didn't get a sid match (either no sid, or sid format
+      // mismatch between weapon_fire and parseGrenades).
+      let matchedPos = 0;
+      grenades.forEach(g => {
+        if (g.path) return;
+        let best = null, bestScore = Infinity;
+        groups.forEach(grp => {
+          if (grp._used) return;
+          const diff = grp.startTick - g.tick;
+          if (diff < -64 || diff > 512) return;
+          const first = grp.points[0];
+          if (!first) return;
+          const dx = (first.X || 0) - g.x;
+          const dy = (first.Y || 0) - g.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist > 200) return; // throw origin must be within 200 units
+          const score = dist + Math.abs(diff) * 0.5;
+          if (score < bestScore) { bestScore = score; best = grp; }
+        });
+        if (best) { attachPath(g, best); matchedPos++; }
+      });
+
+      const matched = matchedSid + matchedPos;
+      console.log(`Grenade paths: sid-matched=${matchedSid}, pos-matched=${matchedPos}, total=${matched}/${grenades.length} (${noSidSkipped} no-sid)`);
       if (matched > 0) {
         const sampleG = grenades.find(g => g.path && g.path.length >= 4);
         if (sampleG) console.log(`Grenade path sample: type=${sampleG.type} tick=${sampleG.tick} detonTick=${sampleG.detonTick} pts=${sampleG.path.length/2}`);
