@@ -50,7 +50,11 @@ const upload = multer({
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.3.0' }));
+app.get('/', (req, res) => {
+  let fzstdOk = false;
+  try { require('fzstd'); fzstdOk = true; } catch (_) {}
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.0', fzstd: fzstdOk });
+});
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
 app.post('/parse', upload.single('demo'), async (req, res) => {
@@ -928,9 +932,13 @@ async function downloadAndParse(matchId, demoUrl) {
       await createNotificationsForMatch(matchId, demoData);
     }
   } catch (err) {
-    console.error(`[parse] ${matchId} error:`, err.message);
+    console.error(`[parse] ${matchId} error:`, err.message, err.stack);
     if (supabaseAdmin) {
-      await supabaseAdmin.from('matches').update({ status: 'failed' }).eq('faceit_match_id', matchId);
+      const errText = `${err.message || 'unknown'} | ${(err.stack || '').split('\n').slice(0, 3).join(' ').slice(0, 500)}`;
+      await supabaseAdmin.from('matches').update({
+        status: 'failed',
+        error_message: errText,
+      }).eq('faceit_match_id', matchId);
     }
   } finally {
     try { fs.unlinkSync(decompressedPath); } catch {}
