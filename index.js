@@ -1413,6 +1413,30 @@ app.get('/debug/try-download', async (req, res) => {
   }
 });
 
+// TEMP debug : re-parse un match en lisant le demo_url deja stocke dans DB.
+// Non-authentifie volontairement — A SUPPRIMER apres la phase de debug
+// du bug off-by-1 sur les matches 16 rounds (v6.8.0).
+app.get('/debug/reparse-stored/:matchId', async (req, res) => {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'supabase not configured' });
+  const { matchId } = req.params;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('matches')
+      .select('demo_url, status')
+      .eq('faceit_match_id', matchId)
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'match not found' });
+    if (!data.demo_url) return res.status(400).json({ error: 'no demo_url stored' });
+    await supabaseAdmin.from('matches').update({ status: 'parsing', error_message: null }).eq('faceit_match_id', matchId);
+    res.status(202).json({ accepted: true, matchId, url_len: data.demo_url.length });
+    downloadAndParse(matchId, data.demo_url).catch(err => console.error('[debug/reparse-stored] error:', err.message));
+  } catch (err) {
+    console.error('[debug/reparse-stored] error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
 // Endpoint manuel pour forcer le parsing d'un match
 //  - utilise par api/import-history (matchId seul)
 //  - utilise par api/submit-demo-url depuis l'extension FragValue (matchId + demoUrl)
