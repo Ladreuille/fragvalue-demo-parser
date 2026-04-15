@@ -940,7 +940,19 @@ async function downloadAndParse(matchId, demoUrl) {
         winner,
         status: 'parsed',
         parsed_at: new Date().toISOString(),
-        demo_data: { meta: demoData.meta, playerStats: demoData.playerStats },
+        demo_data: {
+          meta: demoData.meta,
+          playerStats: demoData.playerStats,
+          // DEBUG : dump minimal des rounds pour diagnostiquer le score. Chaque
+          // entry = { r: freezeR, w: winner(2=T,3=CT), k: isKnife?1:0, d: displayNum }.
+          // A retirer une fois le bug de calcul de score corrige.
+          roundsDebug: (demoData.rounds || []).map(r => ({
+            r: r.round,
+            w: r.winner,
+            k: r.isKnife ? 1 : 0,
+            d: r.displayNum,
+          })),
+        },
       }).eq('faceit_match_id', matchId);
 
       // Insert player rows (upsert)
