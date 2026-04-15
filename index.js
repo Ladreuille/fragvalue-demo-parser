@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.2', fzstd: fzstdOk });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.3', fzstd: fzstdOk });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -1084,6 +1084,39 @@ async function processMatch(matchId) {
   console.log(`[process] ${matchId} demo_url pas encore dispo, retry dans 60s`);
   setTimeout(() => retryDemo(matchId, 1).catch(e => console.error('retry:', e.message)), 60000);
 }
+
+// Recupere l'historique d'un joueur FACEIT
+app.get('/debug/faceit-history/:playerId', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const history = await faceitFetch(`/players/${req.params.playerId}/history?game=cs2&offset=0&limit=20`);
+    const items = (history.items || []).map(m => ({
+      match_id: m.match_id,
+      finished_at: m.finished_at,
+      finished_iso: m.finished_at ? new Date(m.finished_at * 1000).toISOString() : null,
+      started_at: m.started_at,
+    }));
+    res.json({ ok: true, count: items.length, items });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/debug/faceit-lookup/:nickname', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const p = await faceitFetch(`/players?nickname=${encodeURIComponent(req.params.nickname)}&game=cs2`);
+    res.json({ ok: true, player_id: p.player_id, nickname: p.nickname, games: p.games });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // Endpoints de diagnostic (proteges par le webhook secret)
 app.get('/debug/faceit-match/:id', async (req, res) => {
