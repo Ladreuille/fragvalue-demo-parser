@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.5.0', fzstd: fzstdOk, overrideDemoUrl: true });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.6.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -193,16 +193,46 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   // On calculera endTick = startTick du round suivant dans la construction des rounds
   console.log('endTick calculé via startTick du round suivant');
 
-  // Collecter les winners via round_announce_win (plus fiable que round_end)
-  const roundWinners = {}; // round_num → winner (2=CT, 3=T)
+  // ── Winners : on collecte TROIS sources independantes et on merge avec ─
+  // priorite round_end > round_announce_win > last_kill. round_announce_win
+  // seule s est revelee non fiable (1 round mal attribue en H2 sur Dust2
+  // qui finissait 13:8 en realite vs 7:14 calcule). On garde les 3 dans
+  // demo_data.roundsDebug pour pouvoir diagnostiquer si ca re-derape.
+  //
+  // Convention CS2 : winner = 2 (T cote) ou 3 (CT cote).
+
+  // Source A : round_end (le plus direct, fire une fois par round avec
+  // winner + reason). Historiquement "souvent null" dans les vieilles demos
+  // CS2 mais depuis demoparser2 0.3x c est fiable, on re-teste.
+  const roundEndWinners = {};
+  try {
+    const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
+    roundEndEvents.forEach(e => {
+      const r = e.total_rounds_played ?? 0;
+      if (e.winner != null && e.winner !== 0 && roundEndWinners[r] === undefined) {
+        roundEndWinners[r] = e.winner;
+      }
+    });
+    console.log(`round_end events: ${roundEndEvents.length}, winners captured: ${Object.keys(roundEndWinners).length}, sample: R${roundEndEvents[0]?.total_rounds_played} winner=${roundEndEvents[0]?.winner} reason=${roundEndEvents[0]?.reason}`);
+  } catch(e) { console.warn('round_end failed:', e.message); }
+
+  // Source B : round_announce_win (ancienne source primaire, gardee en
+  // fallback). On ne prend que la PREMIERE occurrence par round pour eviter
+  // d etre ecrase par un event re-emis en fin de match.
+  const roundAnnounceWinners = {};
   try {
     const announceWin = parseEvent(demoPath, 'round_announce_win', [], ['winner', 'total_rounds_played', 'tick']);
     announceWin.forEach(e => {
       const r = e.total_rounds_played ?? 0;
-      if (e.winner != null) roundWinners[r] = e.winner;
+      if (e.winner != null && e.winner !== 0 && roundAnnounceWinners[r] === undefined) {
+        roundAnnounceWinners[r] = e.winner;
+      }
     });
-    console.log(`round_announce_win: ${announceWin.length}, sample: R${announceWin[0]?.total_rounds_played} winner=${announceWin[0]?.winner}`);
+    console.log(`round_announce_win: ${announceWin.length}, winners captured: ${Object.keys(roundAnnounceWinners).length}, sample: R${announceWin[0]?.total_rounds_played} winner=${announceWin[0]?.winner}`);
   } catch(e) { console.warn('round_announce_win failed:', e.message); }
+
+  // Alias pour conserver le nom utilise plus bas (fallback legacy).
+  const roundWinners = roundAnnounceWinners;
 
   // Les round nums de freeze_end sont 0-based (R0=knife, R1=round1...)
   // Les kills sont 1-based (round=1=knife, round=2=round1...)
@@ -230,20 +260,45 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   });
   console.log(`Knife rounds detected (freeze nums): ${[...knifeRounds].join(',') || 'none'}`);
 
-  // Déduire winner depuis le dernier kill du round si round_announce_win absent
-  const computedWinners = {...roundWinners};
-  if (Object.keys(roundWinners).length === 0) {
-    roundNums.forEach(freezeR => {
-      const killsR = freezeR + 1;
-      const rKills = kills.filter(k => k.round === killsR);
-      if (!rKills.length) return;
-      const lastKill = rKills.reduce((a,b)=>(a.tick||0)>=(b.tick||0)?a:b);
-      // CT=3 gagne si attaquant est CT, T=2 gagne si attaquant est T
-      if (lastKill.attackerTeam === 3) computedWinners[freezeR] = 3; // CT kills last → CT win
-      else if (lastKill.attackerTeam === 2) computedWinners[freezeR] = 2; // T kills last → T win
-    });
-    console.log(`Winners computed from kills: ${roundNums.slice(0,5).map(r=>`R${r}:${computedWinners[r]||0}`).join(' ')}`);
-  }
+  // Source C : dernier kill du round. Heuristique simple mais tres robuste :
+  // l equipe qui porte le DERNIER kill d un round a presque toujours gagne
+  // ce round (sauf edge case rare : bomb explode sans dernier kill T, ou
+  // defuse sans dernier kill CT, mais dans ces cas on garde round_end /
+  // announce_win via la priorite plus bas).
+  const lastKillWinners = {};
+  roundNums.forEach(freezeR => {
+    const killsR = freezeR + 1;
+    const rKills = kills.filter(k => k.round === killsR);
+    if (!rKills.length) return;
+    const lastKill = rKills.reduce((a, b) => (a.tick || 0) >= (b.tick || 0) ? a : b);
+    if (lastKill.attackerTeam === 3) lastKillWinners[freezeR] = 3;
+    else if (lastKill.attackerTeam === 2) lastKillWinners[freezeR] = 2;
+  });
+  console.log(`last_kill winners captured: ${Object.keys(lastKillWinners).length}`);
+
+  // Merge final : round_end > round_announce_win > last_kill. On trace les
+  // rounds ou les sources divergent pour aider le diagnostic futur.
+  const computedWinners = {};
+  const winnerSources = {}; // freezeR -> 'end' | 'announce' | 'lastkill' | 'none'
+  let divergeCount = 0;
+  roundNums.forEach(freezeR => {
+    const wEnd = roundEndWinners[freezeR];
+    const wAnn = roundAnnounceWinners[freezeR];
+    const wKill = lastKillWinners[freezeR];
+    let chosen = 0, src = 'none';
+    if (wEnd != null) { chosen = wEnd; src = 'end'; }
+    else if (wAnn != null) { chosen = wAnn; src = 'announce'; }
+    else if (wKill != null) { chosen = wKill; src = 'lastkill'; }
+    computedWinners[freezeR] = chosen;
+    winnerSources[freezeR] = src;
+    // Detecter divergences entre sources (utile pour identifier les rounds
+    // ou announce_win ment).
+    const present = [wEnd, wAnn, wKill].filter(w => w != null);
+    if (present.length >= 2 && new Set(present).size > 1) divergeCount++;
+  });
+  const srcCounts = { end: 0, announce: 0, lastkill: 0, none: 0 };
+  Object.values(winnerSources).forEach(s => srcCounts[s]++);
+  console.log(`Winners merged: ${roundNums.length} rounds, sources end=${srcCounts.end} announce=${srcCounts.announce} lastkill=${srcCounts.lastkill} none=${srcCounts.none}, divergences=${divergeCount}`);
 
   let displayCounter = 0;
   const rounds = roundNums.map((freezeR, i) => {
@@ -260,6 +315,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       killsRound: freezeR + 1,
       displayNum: isKnife ? 0 : displayCounter,
       winner:     computedWinners[freezeR] ?? 0,
+      // Dump per-source pour debug de la fiabilite des events CS2.
+      winnerEnd:      roundEndWinners[freezeR] ?? null,
+      winnerAnnounce: roundAnnounceWinners[freezeR] ?? null,
+      winnerLastKill: lastKillWinners[freezeR] ?? null,
+      winnerSource:   winnerSources[freezeR] || 'none',
       startTick,
       endTick,
       isKnife,
@@ -943,12 +1003,17 @@ async function downloadAndParse(matchId, demoUrl) {
         demo_data: {
           meta: demoData.meta,
           playerStats: demoData.playerStats,
-          // DEBUG : dump minimal des rounds pour diagnostiquer le score. Chaque
-          // entry = { r: freezeR, w: winner(2=T,3=CT), k: isKnife?1:0, d: displayNum }.
-          // A retirer une fois le bug de calcul de score corrige.
+          // DEBUG : dump des rounds avec les 3 sources de winner. Chaque
+          // entry = { r, w (final), we (round_end), wa (announce_win),
+          // wk (last_kill), src, k (isKnife), d (displayNum) }.
+          // A retirer une fois la fiabilite confirmee sur plusieurs matchs.
           roundsDebug: (demoData.rounds || []).map(r => ({
             r: r.round,
             w: r.winner,
+            we: r.winnerEnd,
+            wa: r.winnerAnnounce,
+            wk: r.winnerLastKill,
+            src: r.winnerSource,
             k: r.isKnife ? 1 : 0,
             d: r.displayNum,
           })),
@@ -979,24 +1044,24 @@ async function downloadAndParse(matchId, demoUrl) {
 
 // Determine which "team" (team1 = demarre sur CT en H1, team2 = demarre sur T)
 // possede le cote CT pendant un round donne. freezeR est le
-// total_rounds_played 0-based tel que CS2 le stocke dans round_freeze_end :
-// freezeR=0 est le knife FACEIT, freezeR=1..12 = H1, 13..24 = H2, 25+ = OT.
+// total_rounds_played 0-BASED tel que CS2 le stocke dans round_freeze_end.
+//
+// FACEIT CS2 n a PLUS de knife round depuis 2024 (les sides sont decides par
+// le veto), donc freezeR=0 est deja le premier vrai round.
 //
 // En MR12 standard FACEIT :
-//   - H1 (rounds 1..12) : team1 sur CT, team2 sur T
-//   - H2 (rounds 13..24) : sides swap, team1 sur T, team2 sur CT
-//   - OT MR3 (rounds 25+) : chaque "mi-OT" est 3 rounds, les sides alternent
-//     de la meme facon (first OT half = team1 CT, second OT half = team1 T).
+//   - H1 (freezeR 0..11)  : team1 sur CT, team2 sur T
+//   - H2 (freezeR 12..23) : sides swap, team1 sur T, team2 sur CT
+//   - OT MR3 (freezeR 24+) : chaque "mi-OT" = 3 rounds, sides alternent
+//     (first OT half = team1 CT, second OT half = team1 T, next OT idem).
 //
 // Retourne true si team1 est sur CT pendant ce round, false sinon.
 function team1IsCTForRound(freezeR) {
-  if (freezeR >= 1 && freezeR <= 12) return true;
-  if (freezeR >= 13 && freezeR <= 24) return false;
-  // OT MR3: 3 rounds par cote. Floor((otRound-1)/3) donne 0 pour la premiere
-  // mi-OT, 1 pour la seconde, 2 pour la premiere mi-OT de l OT suivant, etc.
-  // On prend modulo 2 pour obtenir l alternance.
+  if (freezeR >= 0 && freezeR <= 11) return true;
+  if (freezeR >= 12 && freezeR <= 23) return false;
+  // OT MR3: 3 rounds par cote. Le premier round d OT est freezeR=24.
   const otRound = freezeR - 24;
-  const halfInOt = Math.floor((otRound - 1) / 3);
+  const halfInOt = Math.floor(otRound / 3);
   return halfInOt % 2 === 0;
 }
 
