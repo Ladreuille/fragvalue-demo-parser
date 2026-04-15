@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.3', fzstd: fzstdOk });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.5.0', fzstd: fzstdOk, overrideDemoUrl: true });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -1060,12 +1060,16 @@ async function createNotificationsForMatch(matchId, demoData) {
 }
 
 // Point d'entree : enregistre le match en DB + lance l'analyse
-async function processMatch(matchId) {
+// Si overrideDemoUrl est fourni (cas extension FragValue), on saute le fetch
+// FACEIT Data API (dont les URLs pointent sur un host decommissionne depuis
+// 2024) et on telecharge directement l'URL S3 presignee fournie par le
+// client.
+async function processMatch(matchId, overrideDemoUrl) {
   if (!supabaseAdmin) {
     console.warn('[process] supabase non configure, skip');
     return;
   }
-  console.log(`[process] ${matchId} start`);
+  console.log(`[process] ${matchId} start${overrideDemoUrl ? ' (override)' : ''}`);
 
   // Enregistrer le match en pending (upsert)
   await supabaseAdmin.from('matches').upsert({
@@ -1073,6 +1077,13 @@ async function processMatch(matchId) {
     faceit_match_id: matchId,
     status: 'pending',
   }, { onConflict: 'faceit_match_id' });
+
+  // Override : l'extension a deja recupere une URL presignee fraiche via
+  // api.faceit.com avec les cookies user, on parse directement.
+  if (overrideDemoUrl) {
+    await supabaseAdmin.from('matches').update({ status: 'parsing', demo_url: overrideDemoUrl, error_message: null }).eq('faceit_match_id', matchId);
+    return downloadAndParse(matchId, overrideDemoUrl);
+  }
 
   // Recuperer le demo_url via FACEIT API
   const { demoUrl } = await getFaceitDemoUrl(matchId);
@@ -1195,16 +1206,18 @@ app.get('/debug/try-download', async (req, res) => {
   }
 });
 
-// Endpoint manuel pour forcer le parsing d'un match (utilise par api/import-history)
+// Endpoint manuel pour forcer le parsing d'un match
+//  - utilise par api/import-history (matchId seul)
+//  - utilise par api/submit-demo-url depuis l'extension FragValue (matchId + demoUrl)
 app.post('/process-match', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '') || '';
   if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const { matchId } = req.body || {};
+  const { matchId, demoUrl } = req.body || {};
   if (!matchId) return res.status(400).json({ error: 'matchId required' });
-  res.status(202).json({ accepted: true, matchId });
-  processMatch(matchId).catch(err => console.error('[process-match] error:', err.message));
+  res.status(202).json({ accepted: true, matchId, override: !!demoUrl });
+  processMatch(matchId, demoUrl).catch(err => console.error('[process-match] error:', err.message));
 });
 
 const server = app.listen(PORT, () => {
