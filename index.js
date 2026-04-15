@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.7.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true, roundEndShift: true });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.8.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true, roundEndShift: true, winPanelSource: true, rawEventDump: true });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -180,13 +180,17 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   const roundStartTicks = {};
   const roundEndTicks = {};
 
+  let freezeEndRaw = [];
   try {
-    const freezeEndEvents = parseEvent(demoPath, 'round_freeze_end', [], ['total_rounds_played', 'tick']);
-    freezeEndEvents.forEach(e => {
+    freezeEndRaw = parseEvent(demoPath, 'round_freeze_end', [], ['total_rounds_played', 'tick']);
+    freezeEndRaw.forEach(e => {
       const r = e.total_rounds_played ?? 0;
       roundStartTicks[r] = e.tick ?? 0;
     });
-    console.log(`Freeze end events: ${freezeEndEvents.length}, sample: R${freezeEndEvents[0]?.total_rounds_played} tick=${freezeEndEvents[0]?.tick}`);
+    console.log(`Freeze end events: ${freezeEndRaw.length}`);
+    freezeEndRaw.forEach((e, i) => {
+      if (i < 30) console.log(`  [${i}] tick=${e.tick} trp=${e.total_rounds_played}`);
+    });
   } catch(e) { console.warn('round_freeze_end failed:', e.message); }
 
   // round_officially_ended désactivé — les ticks sont mal alignés avec freezeR
@@ -223,9 +227,10 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   }
 
   const roundEndWinners = {};
+  let roundEndRaw = [];
   try {
-    const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
-    roundEndEvents.forEach(e => {
+    roundEndRaw = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
+    roundEndRaw.forEach(e => {
       // SHIFT -1 : total_rounds_played ici est 1-based. Le round 1 correspond
       // a freezeR=0, etc. On skippe les events ou total_rounds_played < 1
       // (warmup, pre-match) qui donneraient un freezeR negatif.
@@ -237,8 +242,47 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         roundEndWinners[freezeR] = w;
       }
     });
-    console.log(`round_end events: ${roundEndEvents.length}, winners captured: ${Object.keys(roundEndWinners).length}, sample raw=${roundEndEvents[0]?.total_rounds_played} winner=${roundEndEvents[0]?.winner} reason=${roundEndEvents[0]?.reason}`);
+    console.log(`round_end events: ${roundEndRaw.length}, winners captured: ${Object.keys(roundEndWinners).length}`);
+    console.log(`round_end RAW dump:`);
+    roundEndRaw.forEach((e, i) => {
+      console.log(`  [${i}] tick=${e.tick} trp=${e.total_rounds_played} winner=${e.winner} reason=${e.reason}`);
+    });
   } catch(e) { console.warn('round_end failed:', e.message); }
+
+  // Source D : cs_win_panel_round — event du HUD "winner annonce" qui fire
+  // quand le panel de fin de round s affiche. Potentiellement plus fiable
+  // que round_end sur les matches a fin rapide (13:3) ou round_end semble
+  // mal s aligner. On tente d extraire winner / timestamp + on dump tout
+  // ce qui sort pour debug.
+  const winPanelWinners = {};
+  let winPanelRaw = [];
+  try {
+    winPanelRaw = parseEvent(demoPath, 'cs_win_panel_round', [], ['winner', 'reason', 'total_rounds_played', 'tick', 'funfact_token', 'funfact_player']);
+    console.log(`cs_win_panel_round events: ${winPanelRaw.length}`);
+    winPanelRaw.forEach((e, i) => {
+      if (i < 30) console.log(`  [${i}] tick=${e.tick} trp=${e.total_rounds_played} winner=${e.winner} reason=${e.reason}`);
+      const raw = e.total_rounds_played;
+      if (raw == null || raw < 1) return;
+      const freezeR = raw - 1;
+      const w = normalizeWinner(e.winner);
+      if (w != null && winPanelWinners[freezeR] === undefined) {
+        winPanelWinners[freezeR] = w;
+      }
+    });
+    console.log(`cs_win_panel winners captured: ${Object.keys(winPanelWinners).length}`);
+  } catch(e) { console.warn('cs_win_panel_round failed:', e.message); }
+
+  // Source E : round_officially_ended — fire apres le round_end quand le
+  // round est "officiellement" termine (apres timeout, post-round). Utile
+  // comme sanity check de comptage. Pas de winner, juste un tick.
+  let roundOfficiallyEndedRaw = [];
+  try {
+    roundOfficiallyEndedRaw = parseEvent(demoPath, 'round_officially_ended', [], ['tick', 'total_rounds_played']);
+    console.log(`round_officially_ended events: ${roundOfficiallyEndedRaw.length}`);
+    roundOfficiallyEndedRaw.forEach((e, i) => {
+      if (i < 25) console.log(`  [${i}] tick=${e.tick} trp=${e.total_rounds_played}`);
+    });
+  } catch(e) { console.warn('round_officially_ended failed:', e.message); }
 
   // Source B : round_announce_win — historiquement utilise comme primaire
   // mais s est revelee QUASI-INUTILISABLE sur les demos FACEIT CS2 (emet
@@ -353,12 +397,22 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       winnerEnd:      roundEndWinners[freezeR] ?? null,
       winnerAnnounce: roundAnnounceWinners[freezeR] ?? null,
       winnerLastKill: lastKillWinners[freezeR] ?? null,
+      winnerPanel:    winPanelWinners[freezeR] ?? null,
       winnerSource:   winnerSources[freezeR] || 'none',
       startTick,
       endTick,
       isKnife,
     };
   });
+
+  // Dump des events bruts pour debug — on les passe au downstream via un
+  // attache sur demoData.__rawEventDump qui sera copie dans demo_data.rawEvents
+  const rawEventDump = {
+    freezeEnd: freezeEndRaw.map(e => ({ trp: e.total_rounds_played, tick: e.tick })),
+    roundEnd: roundEndRaw.map(e => ({ trp: e.total_rounds_played, tick: e.tick, winner: e.winner, reason: e.reason })),
+    winPanel: winPanelRaw.map(e => ({ trp: e.total_rounds_played, tick: e.tick, winner: e.winner, reason: e.reason })),
+    roundOfficiallyEnded: roundOfficiallyEndedRaw.map(e => ({ trp: e.total_rounds_played, tick: e.tick })),
+  };
 
   const winnerCheck = rounds.slice(0,4).map(r=>`R${r.round}(k${r.killsRound}):w${r.winner}:knife${r.isKnife?1:0}`).join(' ');
   console.log(`Rounds check: ${winnerCheck}`);
@@ -773,6 +827,7 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     meta: { map: mapName, rounds: rounds.length, totalKills: kills.length, players: allNames, parsedAt: new Date().toISOString(), targetPlayer: resolvedTarget },
     kills: compactKills,
     positions, grenades: grenades.slice(0, 800), shots: shots.slice(0, 3000), rounds, roundStartTicks, playerStats, duelZones, bombPlants,
+    rawEventDump,
   };
 }
 
@@ -1037,20 +1092,25 @@ async function downloadAndParse(matchId, demoUrl) {
         demo_data: {
           meta: demoData.meta,
           playerStats: demoData.playerStats,
-          // DEBUG : dump des rounds avec les 3 sources de winner. Chaque
-          // entry = { r, w (final), we (round_end), wa (announce_win),
-          // wk (last_kill), src, k (isKnife), d (displayNum) }.
-          // A retirer une fois la fiabilite confirmee sur plusieurs matchs.
+          // DEBUG : dump des rounds avec les 4 sources de winner.
+          //  r = freezeR (0-based), w = final, we = round_end,
+          //  wa = announce_win, wk = last_kill, wp = cs_win_panel_round,
+          //  src = source retenue, k = isKnife, d = displayNum.
           roundsDebug: (demoData.rounds || []).map(r => ({
             r: r.round,
             w: r.winner,
             we: r.winnerEnd,
             wa: r.winnerAnnounce,
             wk: r.winnerLastKill,
+            wp: r.winnerPanel,
             src: r.winnerSource,
             k: r.isKnife ? 1 : 0,
             d: r.displayNum,
           })),
+          // Dump des events CS2 bruts pour faire sauter la derniere ambiguite
+          // sur l alignement trp (1-based vs 0-based) et detecter les events
+          // parasites (warmup, restart, etc.).
+          rawEvents: demoData.rawEventDump,
         },
       }).eq('faceit_match_id', matchId);
 
