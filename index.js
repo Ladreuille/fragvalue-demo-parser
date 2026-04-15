@@ -765,8 +765,8 @@ app.post('/webhook/faceit', express.raw({ type: 'application/json', limit: '2mb'
   }
 });
 
-// Telechargement HTTP/HTTPS dans un fichier local
-function downloadFile(url, destPath) {
+// Telechargement HTTP/HTTPS dans un fichier local (single attempt)
+function downloadFileOnce(url, destPath) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https:') ? https : http;
     const file = fs.createWriteStream(destPath);
@@ -774,7 +774,7 @@ function downloadFile(url, destPath) {
       if (response.statusCode === 301 || response.statusCode === 302) {
         file.close();
         fs.unlink(destPath, () => {});
-        return downloadFile(response.headers.location, destPath).then(resolve, reject);
+        return downloadFileOnce(response.headers.location, destPath).then(resolve, reject);
       }
       if (response.statusCode !== 200) {
         file.close();
@@ -788,6 +788,26 @@ function downloadFile(url, destPath) {
       reject(err);
     });
   });
+}
+
+// Wrapper avec retry sur les erreurs reseau transitoires (DNS, socket, reset)
+async function downloadFile(url, destPath, maxAttempts = 4) {
+  const transientCodes = ['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE'];
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await downloadFileOnce(url, destPath);
+    } catch (err) {
+      lastErr = err;
+      const code = err.code || '';
+      const isTransient = transientCodes.includes(code) || /ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT/.test(err.message || '');
+      console.warn(`[download] attempt ${attempt}/${maxAttempts} failed: ${err.message} (code=${code}, transient=${isTransient})`);
+      if (!isTransient || attempt === maxAttempts) throw err;
+      // Backoff 2s, 4s, 8s
+      await new Promise(r => setTimeout(r, 2000 * attempt));
+    }
+  }
+  throw lastErr;
 }
 
 // Appel FACEIT Data API
