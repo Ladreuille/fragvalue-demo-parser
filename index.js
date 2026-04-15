@@ -720,16 +720,17 @@ async function parseDemoFile(demoPath, targetPlayer = null, originalName = '') {
   return parseCS2Demo(demoPath, targetPlayer, originalName);
 }
 
-// Verification signature HMAC SHA256 du webhook FACEIT
+// Verification du header de securite FACEIT
+// FACEIT App Studio envoie un token STATIQUE dans le header configure
+// (pas un HMAC calcule) donc on fait une comparaison directe timing-safe
 function verifyFaceitSignature(rawBody, signature) {
   if (!FACEIT_WEBHOOK_SECRET) return true; // desactive en dev
   if (!signature) return false;
-  const expected = crypto
-    .createHmac('sha256', FACEIT_WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest('hex');
   try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+    const a = Buffer.from(String(signature));
+    const b = Buffer.from(FACEIT_WEBHOOK_SECRET);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   } catch { return false; }
 }
 
