@@ -3,7 +3,24 @@ const multer  = require('multer');
 const cors    = require('cors');
 const fs      = require('fs');
 const os      = require('os');
-const { parseEvent, parsePlayerInfo, parseGrenades } = require('@laihoe/demoparser2');
+const path    = require('path');
+const crypto  = require('crypto');
+const https   = require('https');
+const http    = require('http');
+const { parseEvent, parsePlayerInfo } = require('@laihoe/demoparser2');
+const { createClient } = require('@supabase/supabase-js');
+
+// Supabase admin client (service role) pour ecrire dans matches/match_players/notifications
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
+  : null;
+if (!supabaseAdmin) console.warn('Supabase admin non configure (SUPABASE_URL / SUPABASE_SERVICE_KEY manquants)');
+
+// FACEIT Data API
+const FACEIT_API_KEY = process.env.FACEIT_API_KEY || '';
+const FACEIT_WEBHOOK_SECRET = process.env.FACEIT_WEBHOOK_SECRET || '';
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -79,13 +96,11 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     round:        e.total_rounds_played ?? 0,
     tick:         e.tick ?? 0,
     attacker:     e.attacker_name  || e.attacker || 'Unknown',
-    attackerSid:  e.attacker_steamid != null ? String(e.attacker_steamid) : null,
     attackerTeam: e.attacker_team_num ?? 0,
     attackerX:    e.attacker_X ?? 0,
     attackerY:    e.attacker_Y ?? 0,
     attackerZ:    e.attacker_Z ?? 0,
     victim:       e.user_name || e.user || 'Unknown',
-    victimSid:    e.user_steamid != null ? String(e.user_steamid) : null,
     victimTeam:   e.user_team_num ?? 0,
     victimX:      e.user_X ?? 0,
     victimY:      e.user_Y ?? 0,
@@ -258,8 +273,6 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   const { parseTicks } = require('@laihoe/demoparser2');
   let positions = {};
-  // Hoist sidToName so later blocks (grenades, shots) can look up names by sid.
-  let sidToName = {};
   const TICK_SAMPLE = 32; // 1 tick sur 32 → ~4fps positions, fluide avec interpolation
   // Noms compacts : x,y,t(team),r(round),k(tick),h(hp),w(weapon),a(armor),he(helmet),d(defuser),m(money)
   // ~35000 pts * ~100 bytes ≈ 3.5MB JSON → sous la limite sessionStorage 5MB
@@ -297,7 +310,8 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const firstRow = tickData[0];
     console.log('parseTicks row[0] steamid:', firstRow?.steamid, 'type:', typeof firstRow?.steamid, 'BigInt?', typeof firstRow?.steamid === 'bigint');
 
-    // Construire sidToName en gérant BigInt (hoisted au scope de la fonction)
+    // Construire sidToName en gérant BigInt
+    const sidToName = {};
     // steamToName a des string keys
     Object.entries(steamToName).forEach(([k,v]) => { sidToName[k] = v; });
     // parseTicks peut avoir des BigInt steamids
@@ -313,39 +327,6 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
       if (n && n !== 'unknown' && n !== '') sidToName[sid] = n;
     });
     console.log(`sidToName resolved (${Object.keys(sidToName).length}): ${Object.values(sidToName).join(', ')}`);
-
-    // ── Desambiguation des collisions de noms ───────────────────────────────
-    // parseTicks emit une row par (sid, tick). Si 2 sids partagent le meme
-    // display name, sidToName[sidA] === sidToName[sidB] : leurs samples
-    // fusionnent sous la meme cle dans `positions`, et `playerRowCount[name]`
-    // est incremente par les deux, doublant la frequence d'echantillonnage
-    // et produisant des trails qui sautent entre les 2 joueurs (bug replay).
-    // Fix : suffixer chaque sid en collision avec ses 4 derniers digits, puis
-    // remapper les noms deja figes dans `kills` via leur sid stocke plus haut.
-    const nameToSids = {};
-    Object.entries(sidToName).forEach(([sid, nm]) => {
-      if (!nameToSids[nm]) nameToSids[nm] = [];
-      nameToSids[nm].push(sid);
-    });
-    const collisions = Object.entries(nameToSids).filter(([, sids]) => sids.length > 1);
-    if (collisions.length > 0) {
-      console.warn(`Name collisions detected: ${collisions.map(([nm, sids]) => `"${nm}"x${sids.length}`).join(', ')}`);
-      collisions.forEach(([nm, sids]) => {
-        sids.forEach(sid => {
-          sidToName[sid] = `${nm}#${String(sid).slice(-4)}`;
-        });
-      });
-      // steamToName mirror (utilise par les fallbacks ailleurs)
-      Object.keys(steamToName).forEach(sid => {
-        if (sidToName[sid]) steamToName[sid] = sidToName[sid];
-      });
-      // Remap les kills deja construits via leur sid stocke
-      kills.forEach(k => {
-        if (k.attackerSid && sidToName[k.attackerSid]) k.attacker = sidToName[k.attackerSid];
-        if (k.victimSid   && sidToName[k.victimSid])   k.victim   = sidToName[k.victimSid];
-      });
-      console.log(`Noms apres desambiguation: ${Object.values(sidToName).join(', ')}`);
-    }
 
     // Debug : compter rows par joueur avant filtrage
     const rowCountBySid = {};
@@ -477,32 +458,25 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     const grenadeTypes = new Set(['weapon_flashbang','weapon_smokegrenade','weapon_hegrenade','weapon_molotov','weapon_incgrenade','weapon_decoy']);
     
     // Lancer de grenade (position du lanceur + tick absolu)
-    // IMPORTANT: explicitly request `steamid` and `name` in playerProps —
-    // recent demoparser2 versions do not auto-populate them, so without this
-    // `e.user_steamid` is undefined and our grenade→trajectory matching fails.
-    const gEvents = parseEvent(
-      demoPath,
-      'weapon_fire',
-      ['X', 'Y', 'Z', 'team_num', 'steamid', 'name'],
-      ['weapon', 'tick', 'total_rounds_played']
-    );
-    if (gEvents.length > 0) {
-      console.log(`weapon_fire sample keys: ${Object.keys(gEvents[0]).join(', ')}`);
-    }
-    // weapon_fire `tick` is ABSOLUTE in demoparser2 0.41.x — do NOT shift
-    // it with roundStartTicks. Previously we were double-counting, which
-    // broke grenade→trajectory matching (fire ticks were ~5000 ticks ahead
-    // of actual, so no trajectory fell within the [-64, +512] window).
+    const gEvents = parseEvent(demoPath, 'weapon_fire', ['X', 'Y', 'Z', 'team_num'], ['weapon', 'tick', 'total_rounds_played']);
     const thrown = gEvents.filter(e => grenadeTypes.has(e.weapon)).map(e => {
-      const tSid = e.user_steamid != null ? String(e.user_steamid) : null;
+      const relTick = e.tick ?? 0;
+      let absTick = relTick;
+      if (relTick < 10000 && relTick > 0) {
+        // Relatif — ajouter le startTick du round le plus récent avant ce tick
+        const sortedRounds = Object.entries(roundStartTicks)
+          .map(([r,st]) => ({r:Number(r), st:Number(st)}))
+          .filter(({st}) => st > 0)
+          .sort((a,b) => a.st - b.st);
+        if (sortedRounds.length) absTick = sortedRounds[sortedRounds.length-1].st + relTick;
+      }
       return {
-        tick:      e.tick ?? 0, // already absolute
-        type:      e.weapon,
-        thrower:   (tSid && sidToName[tSid]) || e.user_name || e.user || 'Unknown',
-        throwerSid: tSid,
-        team:      e.user_team_num ?? 0,
-        x:         Math.round(e.user_X ?? 0),
-        y:         Math.round(e.user_Y ?? 0),
+        tick:    absTick,
+        type:    e.weapon,
+        thrower: e.user_name || e.user || 'Unknown',
+        team:    e.user_team_num ?? 0,
+        x:       Math.round(e.user_X ?? 0),
+        y:       Math.round(e.user_Y ?? 0),
       };
     });
 
@@ -527,8 +501,24 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         }
         evs.forEach(e => {
           if (!detonations[key]) detonations[key] = [];
-          // Detonation event `tick` is also ABSOLUTE in demoparser2 0.41.x.
-          const absDetTick = e.tick ?? 0;
+          const ex = e.x ?? e.X ?? e.user_X ?? 0;
+          const ey = e.y ?? e.Y ?? e.user_Y ?? 0;
+          const dt = e.tick ?? 0;
+          // Trouver le tick absolu : chercher le roundStartTick dont start <= dt
+          // Si dt > 10000, déjà absolu
+          let absDetTick = dt;
+          if (dt < 10000 && dt > 0) {
+            // Relatif — trouver le bon round via les roundStartTicks
+            const sortedRounds = Object.entries(roundStartTicks)
+              .map(([r,st]) => ({r:Number(r), st:Number(st)}))
+              .sort((a,b) => a.st - b.st);
+            // Chercher le round dont on est dans la durée
+            for (let ri = sortedRounds.length-1; ri >= 0; ri--) {
+              const {r, st} = sortedRounds[ri];
+              if (st > 0) { absDetTick = st + dt; break; }
+            }
+          }
+          // Les coords sont dans e.x, e.y (other props) selon les logs
           const ex2 = e.x ?? e.X ?? e.user_X ?? 0;
           const ey2 = e.y ?? e.Y ?? e.user_Y ?? 0;
           detonations[key].push({ tick: absDetTick, x: Math.round(ex2), y: Math.round(ey2) });
@@ -587,27 +577,34 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
         : 128;
 
       return {
-        tick:       g.tick,
+        tick:      g.tick,
         detonTick,
-        endTick:    detonTick + duration,
-        type:       g.type,
-        thrower:    g.thrower,
-        throwerSid: g.throwerSid,
-        team:       g.team,
-        x:          g.x,       // position du lanceur
-        y:          g.y,
-        detonX,                // position d'explosion
+        endTick:   detonTick + duration,
+        type:      g.type,
+        thrower:   g.thrower,
+        team:      g.team,
+        x:         g.x,       // position du lanceur
+        y:         g.y,
+        detonX,               // position d'explosion
         detonY,
       };
     });
 
-    // Tirs (gun shots): weapon_fire `tick` is ABSOLUTE already — do not shift.
+    // Tirs séparément pour avoir le tick absolu
+    // On mappe chaque tir sur le tick absolu via roundStartTicks
     const shootEvents = gEvents.filter(e => !grenadeTypes.has(e.weapon));
     shots = shootEvents.map(e => {
-      const sSid = e.user_steamid != null ? String(e.user_steamid) : null;
+      // Trouver le tick absolu : e.tick est relatif au round
+      // On cherche le roundStartTick correspondant au round du tir
+      const relTick = e.tick ?? 0;
+      // Trouver le freezeR dont le startTick <= tick absolu estimé
+      // Heuristique : le tick absolu = relTick + roundStartTick[freezeR]
+      // On trouve le bon round en cherchant dans roundStartTicks
+      const rnd = e.total_rounds_played ?? 0;
+      const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
       return {
-        tick:    e.tick ?? 0, // already absolute
-        shooter: (sSid && sidToName[sSid]) || e.user_name || e.user || 'Unknown',
+        tick:    absTick,
+        shooter: e.user_name || e.user || 'Unknown',
         team:    e.user_team_num ?? 0,
         x:       Math.round(e.user_X ?? e.X ?? 0),
         y:       Math.round(e.user_Y ?? e.Y ?? 0),
@@ -621,187 +618,6 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   console.log(`Grenades: ${grenades.length}, avec détonation distincte: ${matchedDeton}`);
   if (grenades.length > 0) console.log(`Grenade[0]: tick=${grenades[0].tick} detonTick=${grenades[0].detonTick} x=${grenades[0].x} detonX=${grenades[0].detonX}`);
 
-  // ── 6b. Grenade trajectories (per-tick positions for realistic bouncing) ──
-  // parseGrenades returns one row per tick per projectile. CRITICAL: pass
-  // `grenades: false` (3rd arg) so we only get PROJECTILE rows (grenade in
-  // flight) with populated coordinates — the default `true` also includes
-  // held grenades with null x/y, bloating the response 10x with useless data.
-  // Returned row keys: grenade_entity_id, grenade_type, name, steamid,
-  // tick, x, y, z (all lowercase). Trajectories include bounces off walls
-  // and floors — exactly what the frontend needs to render realistic paths.
-  try {
-    const gData = parseGrenades(demoPath, [], false) || [];
-    console.log(`parseGrenades: ${gData.length} projectile trajectory rows`);
-    if (gData.length > 0) {
-      console.log(`parseGrenades sample keys: ${Object.keys(gData[0]).join(', ')}`);
-      console.log(`parseGrenades sample row: ${JSON.stringify(gData[0])}`);
-
-      // Group by grenade_entity_id — BUT the demo engine reuses entity slots
-      // across the whole match once a grenade is destroyed. So a single eid
-      // like "66" can correspond to dozens of different grenades over the
-      // course of the match. We split into sub-groups whenever the tick gap
-      // between consecutive rows exceeds `GAP_SPLIT` ticks (2 seconds), which
-      // is much larger than any tick interval within a single grenade's
-      // lifetime (rows are emitted every tick while the projectile is live).
-      const GAP_SPLIT = 128; // 2 s at 64 tps — safe, well above intra-grenade gaps
-      const byEntity = {};
-      gData.forEach(p => {
-        const eid = p.grenade_entity_id;
-        if (eid == null) return;
-        if (p.x == null || p.y == null) return;
-        if (!byEntity[eid]) byEntity[eid] = [];
-        byEntity[eid].push(p);
-      });
-      const groups = [];
-      Object.entries(byEntity).forEach(([eid, arr]) => {
-        arr.sort((a, b) => (a.tick || 0) - (b.tick || 0));
-        // Walk the entity's row stream, starting a new sub-group every time
-        // the gap from the previous row exceeds GAP_SPLIT. Each sub-group
-        // is ONE physical grenade throw.
-        let currentArr = [];
-        let lastTick = -Infinity;
-        const flush = () => {
-          if (currentArr.length === 0) return;
-          const first = currentArr[0];
-          const last  = currentArr[currentArr.length - 1];
-          groups.push({
-            eid,
-            thrower:   first?.steamid != null ? String(first.steamid) : null,
-            name:      first?.name || '',
-            gtype:     first?.grenade_type || '',
-            startTick: first?.tick ?? 0,
-            endTick:   last?.tick ?? 0,
-            points:    currentArr,
-            _used:     false,
-          });
-          currentArr = [];
-        };
-        for (const row of arr) {
-          const t = row.tick ?? 0;
-          if (t - lastTick > GAP_SPLIT) flush();
-          currentArr.push(row);
-          lastTick = t;
-        }
-        flush();
-      });
-      console.log(`parseGrenades groups: ${groups.length} (by grenade_entity_id + gap-split)`);
-      if (groups.length > 0) {
-        const g0 = groups[0];
-        console.log(`Group[0]: eid=${g0.eid} type=${g0.gtype} thrower=${g0.thrower} startTick=${g0.startTick} endTick=${g0.endTick} pts=${g0.points.length}`);
-      }
-
-      // Helper: attach trajectory group to a grenade object.
-      // CRITICAL: we only want the FLIGHT segment of the trajectory, not the
-      // full entity lifecycle. For smokes/molotovs, the entity persists after
-      // detonation (smoke cloud for 18s, fire for 7s), so parseGrenades keeps
-      // emitting rows at the stationary final position. We detect "landed" by
-      // finding the first point where velocity drops below a small threshold
-      // for N consecutive ticks, and cut the path there.
-      const attachPath = (g, grp) => {
-        grp._used = true;
-        const rawPts = grp.points;
-        // Find landing tick: first run of 6+ consecutive rows where position
-        // moved < 5 units per tick. 5 units/tick ≈ very slow rolling.
-        let landIdx = rawPts.length - 1;
-        const STILL_THRESHOLD = 5;
-        const STILL_RUN = 6;
-        let stillCount = 0;
-        for (let i = 1; i < rawPts.length; i++) {
-          const pa = rawPts[i - 1], pb = rawPts[i];
-          if (pa.x == null || pb.x == null) { stillCount = 0; continue; }
-          const dx = pb.x - pa.x, dy = pb.y - pa.y;
-          const d2 = dx * dx + dy * dy;
-          if (d2 < STILL_THRESHOLD * STILL_THRESHOLD) {
-            stillCount++;
-            if (stillCount >= STILL_RUN) { landIdx = i - STILL_RUN + 1; break; }
-          } else {
-            stillCount = 0;
-          }
-        }
-        const pts = rawPts.slice(0, Math.max(2, landIdx + 1));
-        const flightEndTick = pts[pts.length - 1]?.tick ?? grp.endTick;
-
-        // Downsample flight pts to <=32 waypoints.
-        const maxPts = 32;
-        const step = Math.max(1, Math.floor(pts.length / maxPts));
-        const path = [];
-        for (let i = 0; i < pts.length; i += step) {
-          const px = pts[i].x, py = pts[i].y;
-          if (px == null || py == null) continue;
-          path.push(Math.round(px), Math.round(py));
-        }
-        const last = pts[pts.length - 1];
-        if (last && last.x != null && last.y != null) {
-          const lx = Math.round(last.x), ly = Math.round(last.y);
-          const pLastX = path[path.length - 2], pLastY = path[path.length - 1];
-          if (lx !== pLastX || ly !== pLastY) path.push(lx, ly);
-        }
-        g.path = path;
-
-        // Update detonation tick/position from real landing point.
-        // Preserve the existing effect duration (2304 for smoke, etc.).
-        const effectDuration = Math.max(0, (g.endTick || 0) - (g.detonTick || 0));
-        g.detonTick = flightEndTick;
-        g.endTick   = flightEndTick + effectDuration;
-        if (last && last.x != null && last.y != null) {
-          g.detonX = Math.round(last.x);
-          g.detonY = Math.round(last.y);
-        }
-      };
-
-      // Pass 1: match by thrower steamid + tick proximity (best signal).
-      // Wide tick window (−64 to +512) because weapon_fire tick and the first
-      // trajectory tick are offset by the throw animation (~20-40 ticks for
-      // a jump-throw), and detonation can be up to 8s later for cooked HE.
-      let matchedSid = 0, noSidSkipped = 0;
-      grenades.forEach(g => {
-        if (!g.throwerSid) { noSidSkipped++; return; }
-        let best = null, bestAbs = Infinity;
-        groups.forEach(grp => {
-          if (grp._used) return;
-          if (grp.thrower !== g.throwerSid) return;
-          const diff = grp.startTick - g.tick;
-          if (diff < -64 || diff > 512) return;
-          const ad = Math.abs(diff);
-          if (ad < bestAbs) { bestAbs = ad; best = grp; }
-        });
-        if (best) { attachPath(g, best); matchedSid++; }
-      });
-
-      // Pass 2: fallback match by thrower position + tick proximity for
-      // grenades that didn't get a sid match (either no sid, or sid format
-      // mismatch between weapon_fire and parseGrenades).
-      let matchedPos = 0;
-      grenades.forEach(g => {
-        if (g.path) return;
-        let best = null, bestScore = Infinity;
-        groups.forEach(grp => {
-          if (grp._used) return;
-          const diff = grp.startTick - g.tick;
-          if (diff < -64 || diff > 512) return;
-          const first = grp.points[0];
-          if (!first || first.x == null || first.y == null) return;
-          const dx = first.x - g.x;
-          const dy = first.y - g.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist > 250) return; // throw origin must be within 250 units
-          const score = dist + Math.abs(diff) * 0.5;
-          if (score < bestScore) { bestScore = score; best = grp; }
-        });
-        if (best) { attachPath(g, best); matchedPos++; }
-      });
-
-      const matched = matchedSid + matchedPos;
-      console.log(`Grenade paths: sid-matched=${matchedSid}, pos-matched=${matchedPos}, total=${matched}/${grenades.length} (${noSidSkipped} no-sid)`);
-      if (matched > 0) {
-        const sampleG = grenades.find(g => g.path && g.path.length >= 4);
-        if (sampleG) console.log(`Grenade path sample: type=${sampleG.type} tick=${sampleG.tick} detonTick=${sampleG.detonTick} pts=${sampleG.path.length/2} path=[${sampleG.path.slice(0,10).join(',')}...]`);
-      }
-    }
-  } catch(e) {
-    console.warn('parseGrenades failed:', e.message, e.stack);
-  }
-
   // ── 6b. Bomb planted events ───────────────────────────────────────────────
   let bombPlants = [];
   try {
@@ -810,8 +626,10 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     // We need the planter's position - use X, Y fields if available
     bombPlants = bombEvents.map(e => {
       const rnd = e.total_rounds_played ?? 0;
+      const relTick = e.tick ?? 0;
+      const absTick = (roundStartTicks[rnd] ?? 0) + relTick;
       return {
-        tick: e.tick ?? 0, // already absolute
+        tick: absTick,
         round: rnd + 1,
         x: Math.round(e.user_X ?? e.X ?? 0),
         y: Math.round(e.user_Y ?? e.Y ?? 0),
@@ -892,6 +710,334 @@ function computeDuelZones(kills, mapName) {
     winRate: z.kills+z.deaths > 0 ? ((z.kills/(z.kills+z.deaths))*100).toFixed(0) : '50',
   }));
 }
+
+// ============================================================================
+// FACEIT WEBHOOK : auto-parse post-match
+// ============================================================================
+
+// Wrapper qui reutilise parseCS2Demo
+async function parseDemoFile(demoPath, targetPlayer = null, originalName = '') {
+  return parseCS2Demo(demoPath, targetPlayer, originalName);
+}
+
+// Verification signature HMAC SHA256 du webhook FACEIT
+function verifyFaceitSignature(rawBody, signature) {
+  if (!FACEIT_WEBHOOK_SECRET) return true; // desactive en dev
+  if (!signature) return false;
+  const expected = crypto
+    .createHmac('sha256', FACEIT_WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch { return false; }
+}
+
+// Capture du raw body pour signature (multer est deja sur /parse uniquement)
+app.post('/webhook/faceit', express.raw({ type: 'application/json', limit: '2mb' }), async (req, res) => {
+  const rawBody = req.body instanceof Buffer ? req.body.toString('utf8') : JSON.stringify(req.body || {});
+  const sig = req.headers['x-faceit-signature'] || req.headers['x-signature'] || '';
+  if (!verifyFaceitSignature(rawBody, sig)) {
+    console.warn('[webhook] signature invalide');
+    return res.status(401).json({ error: 'invalid signature' });
+  }
+
+  let payload;
+  try { payload = JSON.parse(rawBody); }
+  catch { return res.status(400).json({ error: 'invalid json' }); }
+
+  const event = payload.event || payload.type || '';
+  const matchId = payload.payload?.id || payload.data?.id || payload.match_id || payload.id || null;
+  console.log(`[webhook] event=${event} matchId=${matchId}`);
+
+  // On ack immediatement pour FACEIT (timeout court) puis on traite en arriere-plan
+  res.status(200).json({ received: true, matchId });
+
+  if (event.includes('match_status_finished') || event.includes('finished')) {
+    if (matchId) {
+      processMatch(matchId).catch(err => console.error('[webhook] processMatch error:', err.message));
+    }
+  }
+});
+
+// Telechargement HTTP/HTTPS dans un fichier local
+function downloadFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https:') ? https : http;
+    const file = fs.createWriteStream(destPath);
+    client.get(url, { timeout: 120000 }, (response) => {
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        return downloadFile(response.headers.location, destPath).then(resolve, reject);
+      }
+      if (response.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        return reject(new Error(`HTTP ${response.statusCode}`));
+      }
+      response.pipe(file);
+      file.on('finish', () => file.close(() => resolve(destPath)));
+    }).on('error', (err) => {
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+// Appel FACEIT Data API
+function faceitFetch(endpoint) {
+  return new Promise((resolve, reject) => {
+    if (!FACEIT_API_KEY) return reject(new Error('FACEIT_API_KEY manquant'));
+    const url = `https://open.faceit.com/data/v4${endpoint}`;
+    const req = https.request(url, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${FACEIT_API_KEY}`, 'Accept': 'application/json' },
+      timeout: 15000,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+        } else {
+          reject(new Error(`FACEIT ${res.statusCode}: ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Recupere le demo_url du match via l'API FACEIT
+async function getFaceitDemoUrl(matchId) {
+  try {
+    const match = await faceitFetch(`/matches/${matchId}`);
+    const urls = match?.demo_url || match?.demo_urls || [];
+    const demoUrl = Array.isArray(urls) ? urls[0] : urls;
+    return { demoUrl, match };
+  } catch (err) {
+    console.warn(`[faceit] ${matchId} demo_url error:`, err.message);
+    return { demoUrl: null, match: null };
+  }
+}
+
+// Retry si la demo FACEIT n'est pas encore prete (delai 3-10min post-match)
+async function retryDemo(matchId, attempt = 0) {
+  const MAX_ATTEMPTS = 12; // 12 x 60s = 12 min max
+  if (attempt >= MAX_ATTEMPTS) {
+    console.warn(`[retry] ${matchId} abandonne apres ${MAX_ATTEMPTS} tentatives`);
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('matches').update({ status: 'failed' }).eq('faceit_match_id', matchId);
+    }
+    return;
+  }
+  console.log(`[retry] ${matchId} tentative ${attempt + 1}/${MAX_ATTEMPTS}`);
+  const { demoUrl } = await getFaceitDemoUrl(matchId);
+  if (demoUrl) {
+    return downloadAndParse(matchId, demoUrl);
+  }
+  // Retry dans 60s
+  setTimeout(() => retryDemo(matchId, attempt + 1).catch(e => console.error('retryDemo:', e.message)), 60000);
+}
+
+// Telecharge + parse + stocke les resultats
+async function downloadAndParse(matchId, demoUrl) {
+  console.log(`[parse] ${matchId} download: ${demoUrl}`);
+  const tmpPath = path.join(os.tmpdir(), `faceit_${matchId}_${Date.now()}.dem`);
+  let decompressedPath = tmpPath;
+
+  try {
+    // Les demos FACEIT sont en .gz — on telecharge puis on decompresse
+    const downloadPath = tmpPath + '.gz';
+    await downloadFile(demoUrl, downloadPath);
+    const stat = fs.statSync(downloadPath);
+    console.log(`[parse] ${matchId} downloaded ${(stat.size/1024/1024).toFixed(1)} MB`);
+
+    // Decompression gzip
+    const zlib = require('zlib');
+    await new Promise((resolve, reject) => {
+      const inp = fs.createReadStream(downloadPath);
+      const out = fs.createWriteStream(decompressedPath);
+      inp.pipe(zlib.createGunzip()).pipe(out);
+      out.on('finish', resolve);
+      out.on('error', reject);
+      inp.on('error', reject);
+    });
+    fs.unlink(downloadPath, () => {});
+
+    // Parse
+    const demoData = await parseDemoFile(decompressedPath, null, `${matchId}.dem`);
+    console.log(`[parse] ${matchId} done: ${demoData.meta.rounds} rounds, ${demoData.meta.totalKills} kills`);
+
+    // Compute per-player stats avec FV Rating
+    const playerRows = computePlayerStats(demoData, matchId);
+
+    if (supabaseAdmin) {
+      // Update match row
+      const score = computeScoreFromRounds(demoData.rounds);
+      const winner = score.winner; // 'ct' | 't' | 'draw'
+      await supabaseAdmin.from('matches').update({
+        map: demoData.meta.map,
+        rounds: demoData.meta.rounds,
+        score_ct: score.ct,
+        score_t: score.t,
+        winner,
+        status: 'parsed',
+        parsed_at: new Date().toISOString(),
+        demo_data: { meta: demoData.meta, playerStats: demoData.playerStats },
+      }).eq('faceit_match_id', matchId);
+
+      // Insert player rows (upsert)
+      if (playerRows.length > 0) {
+        await supabaseAdmin.from('match_players').upsert(playerRows, { onConflict: 'match_id,nickname' });
+      }
+
+      // Notifier les users FragValue qui ont joue ce match
+      await createNotificationsForMatch(matchId, demoData);
+    }
+  } catch (err) {
+    console.error(`[parse] ${matchId} error:`, err.message);
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('matches').update({ status: 'failed' }).eq('faceit_match_id', matchId);
+    }
+  } finally {
+    try { fs.unlinkSync(decompressedPath); } catch {}
+  }
+}
+
+// Calcul score final a partir des rounds
+function computeScoreFromRounds(rounds) {
+  let ct = 0, t = 0;
+  rounds.forEach(r => {
+    if (r.isKnife) return;
+    if (r.winner === 3) ct++;
+    else if (r.winner === 2) t++;
+  });
+  const winner = ct > t ? 'ct' : t > ct ? 't' : 'draw';
+  return { ct, t, winner };
+}
+
+// Stats par joueur avec FV Rating
+function computePlayerStats(demoData, matchId) {
+  const rounds = demoData.meta?.rounds || 1;
+  const kills = demoData.kills || [];
+  const ps = demoData.playerStats || [];
+
+  // Compter first kills (premier kill de chaque round)
+  const firstKillsByName = {};
+  const byRound = {};
+  kills.forEach(k => {
+    const r = k.r ?? 0;
+    if (!byRound[r]) byRound[r] = [];
+    byRound[r].push(k);
+  });
+  Object.values(byRound).forEach(rk => {
+    rk.sort((a, b) => (a.t || 0) - (b.t || 0));
+    const first = rk[0];
+    if (first) firstKillsByName[first.a] = (firstKillsByName[first.a] || 0) + 1;
+  });
+
+  return ps.map(p => {
+    const kpr = rounds > 0 ? p.kills / rounds : 0;
+    const dpr = rounds > 0 ? p.deaths / rounds : 0;
+    // FV Rating simplifie (a la HLTV 2.0) : KPR + survie + impact
+    const survival = Math.max(0, 1 - dpr);
+    const fv = (kpr * 0.7) + (survival * 0.3) + ((p.hs / Math.max(1, p.kills)) * 0.1);
+    return {
+      match_id: matchId,
+      nickname: p.name,
+      kills: p.kills,
+      deaths: p.deaths,
+      assists: 0,
+      hs_pct: parseFloat(p.hsPct) || 0,
+      adr: 0,
+      kast: 0,
+      first_kills: firstKillsByName[p.name] || 0,
+      fv_rating: parseFloat(fv.toFixed(2)),
+    };
+  });
+}
+
+// Cree les notifications + lie les users FragValue qui ont joue
+async function createNotificationsForMatch(matchId, demoData) {
+  if (!supabaseAdmin) return;
+  const nicknames = (demoData.playerStats || []).map(p => p.name);
+  if (!nicknames.length) return;
+
+  // Trouver les profiles qui matchent un nickname via faceit_nickname
+  const { data: profiles } = await supabaseAdmin
+    .from('profiles')
+    .select('id, faceit_nickname')
+    .in('faceit_nickname', nicknames);
+
+  if (!profiles?.length) {
+    console.log(`[notify] ${matchId} aucun profil FragValue matche`);
+    return;
+  }
+
+  // Lier le match au premier user (owner) + notifier tous
+  await supabaseAdmin.from('matches').update({ user_id: profiles[0].id }).eq('faceit_match_id', matchId);
+
+  // Mettre a jour match_players avec user_id
+  for (const prof of profiles) {
+    await supabaseAdmin.from('match_players')
+      .update({ user_id: prof.id })
+      .eq('match_id', matchId)
+      .eq('nickname', prof.faceit_nickname);
+  }
+
+  // Inserer les notifications
+  const notifs = profiles.map(prof => ({
+    user_id: prof.id,
+    type: 'match_parsed',
+    title: 'Match analyse',
+    message: `Ton match ${demoData.meta?.map || ''} est pret a consulter`,
+    match_id: matchId,
+    read: false,
+  }));
+  await supabaseAdmin.from('notifications').insert(notifs);
+  console.log(`[notify] ${matchId} ${notifs.length} notifications creees`);
+}
+
+// Point d'entree : enregistre le match en DB + lance l'analyse
+async function processMatch(matchId) {
+  if (!supabaseAdmin) {
+    console.warn('[process] supabase non configure, skip');
+    return;
+  }
+  console.log(`[process] ${matchId} start`);
+
+  // Enregistrer le match en pending (upsert)
+  await supabaseAdmin.from('matches').upsert({
+    id: matchId,
+    faceit_match_id: matchId,
+    status: 'pending',
+  }, { onConflict: 'faceit_match_id' });
+
+  // Recuperer le demo_url via FACEIT API
+  const { demoUrl } = await getFaceitDemoUrl(matchId);
+  if (demoUrl) {
+    await supabaseAdmin.from('matches').update({ status: 'parsing', demo_url: demoUrl }).eq('faceit_match_id', matchId);
+    return downloadAndParse(matchId, demoUrl);
+  }
+  // Pas encore dispo → retry en arriere-plan
+  console.log(`[process] ${matchId} demo_url pas encore dispo, retry dans 60s`);
+  setTimeout(() => retryDemo(matchId, 1).catch(e => console.error('retry:', e.message)), 60000);
+}
+
+// Endpoint manuel pour forcer le parsing d'un match (utilise par api/import-history)
+app.post('/process-match', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { matchId } = req.body || {};
+  if (!matchId) return res.status(400).json({ error: 'matchId required' });
+  res.status(202).json({ accepted: true, matchId });
+  processMatch(matchId).catch(err => console.error('[process-match] error:', err.message));
+});
 
 const server = app.listen(PORT, () => {
   server.keepAliveTimeout = 620000;
