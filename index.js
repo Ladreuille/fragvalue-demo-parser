@@ -850,22 +850,51 @@ async function downloadAndParse(matchId, demoUrl) {
   let decompressedPath = tmpPath;
 
   try {
-    // Les demos FACEIT sont en .gz — on telecharge puis on decompresse
-    const downloadPath = tmpPath + '.gz';
+    // FACEIT sert actuellement du .dem.zst (Zstandard). Historiquement c'etait
+    // du .dem.gz. On detecte via l'extension de l'URL + un sniff des magic bytes
+    // pour gerer les deux cas de facon robuste.
+    const lowerUrl = (demoUrl || '').toLowerCase().split('?')[0];
+    const extHint = lowerUrl.endsWith('.zst') ? 'zst'
+                  : lowerUrl.endsWith('.gz')  ? 'gz'
+                  : 'unknown';
+    const downloadPath = `${tmpPath}.${extHint === 'unknown' ? 'bin' : extHint}`;
     await downloadFile(demoUrl, downloadPath);
     const stat = fs.statSync(downloadPath);
-    console.log(`[parse] ${matchId} downloaded ${(stat.size/1024/1024).toFixed(1)} MB`);
+    console.log(`[parse] ${matchId} downloaded ${(stat.size/1024/1024).toFixed(1)} MB (${extHint})`);
 
-    // Decompression gzip
-    const zlib = require('zlib');
-    await new Promise((resolve, reject) => {
-      const inp = fs.createReadStream(downloadPath);
-      const out = fs.createWriteStream(decompressedPath);
-      inp.pipe(zlib.createGunzip()).pipe(out);
-      out.on('finish', resolve);
-      out.on('error', reject);
-      inp.on('error', reject);
-    });
+    // Sniff des 4 premiers octets pour determiner le format reellement recu
+    const head = Buffer.alloc(4);
+    const fd = fs.openSync(downloadPath, 'r');
+    fs.readSync(fd, head, 0, 4, 0);
+    fs.closeSync(fd);
+    const isGzip = head[0] === 0x1f && head[1] === 0x8b;
+    const isZstd = head[0] === 0x28 && head[1] === 0xb5 && head[2] === 0x2f && head[3] === 0xfd;
+    const isDem  = head.toString('ascii', 0, 4) === 'PBDE' || head.toString('ascii', 0, 4) === 'HL2D';
+
+    if (isGzip) {
+      // gunzip streame
+      const zlib = require('zlib');
+      await new Promise((resolve, reject) => {
+        const inp = fs.createReadStream(downloadPath);
+        const out = fs.createWriteStream(decompressedPath);
+        inp.pipe(zlib.createGunzip()).pipe(out);
+        out.on('finish', resolve);
+        out.on('error', reject);
+        inp.on('error', reject);
+      });
+    } else if (isZstd) {
+      // fzstd: pure JS, pas de binding natif — lit le fichier en memoire puis
+      // ecrit le buffer decompresse. Taille typique ~50-120MB, OK pour Railway.
+      const fzstd = require('fzstd');
+      const compressed = fs.readFileSync(downloadPath);
+      const decompressed = fzstd.decompress(compressed);
+      fs.writeFileSync(decompressedPath, Buffer.from(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength));
+    } else if (isDem) {
+      // Deja un .dem non compresse — on renomme
+      fs.copyFileSync(downloadPath, decompressedPath);
+    } else {
+      throw new Error(`Format demo inconnu (magic=${head.toString('hex')})`);
+    }
     fs.unlink(downloadPath, () => {});
 
     // Parse
