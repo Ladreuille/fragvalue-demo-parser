@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.1', fzstd: fzstdOk });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.2', fzstd: fzstdOk });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -1120,6 +1120,45 @@ app.get('/debug/dns/:host', async (req, res) => {
     res.json({ ok: true, host: req.params.host, addrs });
   } catch (err) {
     res.json({ ok: false, host: req.params.host, code: err.code, error: err.message });
+  }
+});
+
+// Resolve via Cloudflare DNS-over-HTTPS (1.1.1.1) pour voir si le host
+// existe dans le DNS public global, independamment du resolver Railway
+app.get('/debug/doh/:host', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const host = req.params.host;
+  const dohUrl = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`;
+  https.get(dohUrl, { headers: { accept: 'application/dns-json' } }, (r) => {
+    let data = '';
+    r.on('data', c => data += c);
+    r.on('end', () => {
+      try { res.json(JSON.parse(data)); } catch { res.status(500).send(data); }
+    });
+  }).on('error', (e) => res.status(500).json({ error: e.message }));
+});
+
+// Test le telechargement depuis une URL donnee (retourne status + taille + host)
+app.get('/debug/try-download', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  const tmp = path.join(os.tmpdir(), `dbg_${Date.now()}.bin`);
+  const started = Date.now();
+  try {
+    await downloadFileOnce(url, tmp);
+    const stat = fs.statSync(tmp);
+    fs.unlinkSync(tmp);
+    res.json({ ok: true, url, bytes: stat.size, ms: Date.now() - started });
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    res.json({ ok: false, url, code: err.code, error: err.message, ms: Date.now() - started });
   }
 });
 
