@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.0', fzstd: fzstdOk });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.4.1', fzstd: fzstdOk });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -1084,6 +1084,44 @@ async function processMatch(matchId) {
   console.log(`[process] ${matchId} demo_url pas encore dispo, retry dans 60s`);
   setTimeout(() => retryDemo(matchId, 1).catch(e => console.error('retry:', e.message)), 60000);
 }
+
+// Endpoints de diagnostic (proteges par le webhook secret)
+app.get('/debug/faceit-match/:id', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const match = await faceitFetch(`/matches/${req.params.id}`);
+    res.json({
+      ok: true,
+      demo_url: match?.demo_url,
+      demo_urls: match?.demo_urls,
+      best_of: match?.best_of,
+      status: match?.status,
+      voting: match?.voting,
+      results: match?.results,
+      region: match?.region,
+      full: match,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+const dns = require('dns').promises;
+app.get('/debug/dns/:host', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '') || '';
+  if (FACEIT_WEBHOOK_SECRET && token !== FACEIT_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const addrs = await dns.lookup(req.params.host, { all: true });
+    res.json({ ok: true, host: req.params.host, addrs });
+  } catch (err) {
+    res.json({ ok: false, host: req.params.host, code: err.code, error: err.message });
+  }
+});
 
 // Endpoint manuel pour forcer le parsing d'un match (utilise par api/import-history)
 app.post('/process-match', async (req, res) => {
