@@ -965,16 +965,52 @@ async function downloadAndParse(matchId, demoUrl) {
   }
 }
 
-// Calcul score final a partir des rounds
+// Determine which "team" (team1 = demarre sur CT en H1, team2 = demarre sur T)
+// possede le cote CT pendant un round donne. freezeR est le
+// total_rounds_played 0-based tel que CS2 le stocke dans round_freeze_end :
+// freezeR=0 est le knife FACEIT, freezeR=1..12 = H1, 13..24 = H2, 25+ = OT.
+//
+// En MR12 standard FACEIT :
+//   - H1 (rounds 1..12) : team1 sur CT, team2 sur T
+//   - H2 (rounds 13..24) : sides swap, team1 sur T, team2 sur CT
+//   - OT MR3 (rounds 25+) : chaque "mi-OT" est 3 rounds, les sides alternent
+//     de la meme facon (first OT half = team1 CT, second OT half = team1 T).
+//
+// Retourne true si team1 est sur CT pendant ce round, false sinon.
+function team1IsCTForRound(freezeR) {
+  if (freezeR >= 1 && freezeR <= 12) return true;
+  if (freezeR >= 13 && freezeR <= 24) return false;
+  // OT MR3: 3 rounds par cote. Floor((otRound-1)/3) donne 0 pour la premiere
+  // mi-OT, 1 pour la seconde, 2 pour la premiere mi-OT de l OT suivant, etc.
+  // On prend modulo 2 pour obtenir l alternance.
+  const otRound = freezeR - 24;
+  const halfInOt = Math.floor((otRound - 1) / 3);
+  return halfInOt % 2 === 0;
+}
+
+// Calcul score final par equipe (pas par side) a partir des rounds.
+// ATTENTION NAMING : les colonnes DB s appellent score_ct / score_t pour
+// des raisons historiques mais stockent en realite les scores TEAM1 / TEAM2
+// (team1 = equipe qui a demarre sur CT en H1, team2 = equipe qui a demarre
+// sur T en H1). Sans ce tracking on obtient des scores absurdes du genre
+// 10:11 pour un vrai match 13:8 car les rounds de H2 sont attribues au
+// mauvais cote apres le swap de mi-temps.
 function computeScoreFromRounds(rounds) {
-  let ct = 0, t = 0;
+  let team1 = 0, team2 = 0;
   rounds.forEach(r => {
     if (r.isKnife) return;
-    if (r.winner === 3) ct++;
-    else if (r.winner === 2) t++;
+    const ctWon = r.winner === 3;
+    const tWon  = r.winner === 2;
+    if (!ctWon && !tWon) return;
+    const team1OnCT = team1IsCTForRound(r.round);
+    if (ctWon) {
+      if (team1OnCT) team1++; else team2++;
+    } else {
+      if (team1OnCT) team2++; else team1++;
+    }
   });
-  const winner = ct > t ? 'ct' : t > ct ? 't' : 'draw';
-  return { ct, t, winner };
+  const winner = team1 > team2 ? 'ct' : team2 > team1 ? 't' : 'draw';
+  return { ct: team1, t: team2, winner };
 }
 
 // Stats par joueur avec FV Rating
