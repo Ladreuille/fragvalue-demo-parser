@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.6.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.7.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true, roundEndShift: true });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -201,37 +201,70 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   //
   // Convention CS2 : winner = 2 (T cote) ou 3 (CT cote).
 
-  // Source A : round_end (le plus direct, fire une fois par round avec
-  // winner + reason). Historiquement "souvent null" dans les vieilles demos
-  // CS2 mais depuis demoparser2 0.3x c est fiable, on re-teste.
+  // Source A : round_end — source PRIMAIRE. Fire une fois par round avec
+  // winner ("T"/"CT" string) + reason. Historique des pieges :
+  //   - total_rounds_played de round_end est 1-BASED (1..N) alors que
+  //     round_freeze_end est 0-BASED (0..N-1). On shift -1 pour aligner.
+  //   - winner est retourne en STRING "T" / "CT" (pas 2/3 entier). On
+  //     normalise en 2/3 pour uniformiser avec last_kill.
+  //   - round_end peut ne pas emettre pour tous les rounds (on a observe
+  //     20 events sur un match a 21 rounds). Les trous sont couverts par
+  //     last_kill en fallback.
+  const WIN_T_SIDE = 2;
+  const WIN_CT_SIDE = 3;
+  function normalizeWinner(w) {
+    if (w === WIN_T_SIDE || w === WIN_CT_SIDE) return w;
+    if (typeof w === 'string') {
+      const s = w.toUpperCase().trim();
+      if (s === 'T' || s === 'TERRORIST' || s === 'T_SIDE') return WIN_T_SIDE;
+      if (s === 'CT' || s === 'COUNTERTERRORIST' || s === 'CT_SIDE') return WIN_CT_SIDE;
+    }
+    return null;
+  }
+
   const roundEndWinners = {};
   try {
     const roundEndEvents = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
     roundEndEvents.forEach(e => {
-      const r = e.total_rounds_played ?? 0;
-      if (e.winner != null && e.winner !== 0 && roundEndWinners[r] === undefined) {
-        roundEndWinners[r] = e.winner;
+      // SHIFT -1 : total_rounds_played ici est 1-based. Le round 1 correspond
+      // a freezeR=0, etc. On skippe les events ou total_rounds_played < 1
+      // (warmup, pre-match) qui donneraient un freezeR negatif.
+      const raw = e.total_rounds_played;
+      if (raw == null || raw < 1) return;
+      const freezeR = raw - 1;
+      const w = normalizeWinner(e.winner);
+      if (w != null && roundEndWinners[freezeR] === undefined) {
+        roundEndWinners[freezeR] = w;
       }
     });
-    console.log(`round_end events: ${roundEndEvents.length}, winners captured: ${Object.keys(roundEndWinners).length}, sample: R${roundEndEvents[0]?.total_rounds_played} winner=${roundEndEvents[0]?.winner} reason=${roundEndEvents[0]?.reason}`);
+    console.log(`round_end events: ${roundEndEvents.length}, winners captured: ${Object.keys(roundEndWinners).length}, sample raw=${roundEndEvents[0]?.total_rounds_played} winner=${roundEndEvents[0]?.winner} reason=${roundEndEvents[0]?.reason}`);
   } catch(e) { console.warn('round_end failed:', e.message); }
 
-  // Source B : round_announce_win (ancienne source primaire, gardee en
-  // fallback). On ne prend que la PREMIERE occurrence par round pour eviter
-  // d etre ecrase par un event re-emis en fin de match.
+  // Source B : round_announce_win — historiquement utilise comme primaire
+  // mais s est revelee QUASI-INUTILISABLE sur les demos FACEIT CS2 (emet
+  // rarement des events, winners souvent null). On la garde en secondaire
+  // au cas ou elle rapporterait qqch d utile, et pour le debug dump.
+  // Convention : meme base que round_end (1-based) si on trouve des events
+  // ; on prefere detecter runtime plutot que hardcoder.
   const roundAnnounceWinners = {};
   try {
     const announceWin = parseEvent(demoPath, 'round_announce_win', [], ['winner', 'total_rounds_played', 'tick']);
     announceWin.forEach(e => {
-      const r = e.total_rounds_played ?? 0;
-      if (e.winner != null && e.winner !== 0 && roundAnnounceWinners[r] === undefined) {
-        roundAnnounceWinners[r] = e.winner;
+      const raw = e.total_rounds_played;
+      if (raw == null) return;
+      // On applique le shift -1 en supposant qu il est aussi 1-based comme
+      // round_end. Si le shift donne un freezeR negatif on skip.
+      const freezeR = raw - 1;
+      if (freezeR < 0) return;
+      const w = normalizeWinner(e.winner);
+      if (w != null && roundAnnounceWinners[freezeR] === undefined) {
+        roundAnnounceWinners[freezeR] = w;
       }
     });
-    console.log(`round_announce_win: ${announceWin.length}, winners captured: ${Object.keys(roundAnnounceWinners).length}, sample: R${announceWin[0]?.total_rounds_played} winner=${announceWin[0]?.winner}`);
+    console.log(`round_announce_win: ${announceWin.length}, winners captured: ${Object.keys(roundAnnounceWinners).length}`);
   } catch(e) { console.warn('round_announce_win failed:', e.message); }
 
-  // Alias pour conserver le nom utilise plus bas (fallback legacy).
+  // Alias legacy.
   const roundWinners = roundAnnounceWinners;
 
   // Les round nums de freeze_end sont 0-based (R0=knife, R1=round1...)
@@ -276,29 +309,30 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
   });
   console.log(`last_kill winners captured: ${Object.keys(lastKillWinners).length}`);
 
-  // Merge final : round_end > round_announce_win > last_kill. On trace les
-  // rounds ou les sources divergent pour aider le diagnostic futur.
+  // Merge final : round_end > last_kill > round_announce_win. round_end
+  // est normalise en 2/3 et 0-based (shift applique plus haut) donc
+  // directement comparable avec last_kill. announce_win est degrade en
+  // tertiaire car peu fiable sur les demos FACEIT CS2.
   const computedWinners = {};
-  const winnerSources = {}; // freezeR -> 'end' | 'announce' | 'lastkill' | 'none'
+  const winnerSources = {}; // freezeR -> 'end' | 'lastkill' | 'announce' | 'none'
   let divergeCount = 0;
   roundNums.forEach(freezeR => {
     const wEnd = roundEndWinners[freezeR];
-    const wAnn = roundAnnounceWinners[freezeR];
     const wKill = lastKillWinners[freezeR];
+    const wAnn = roundAnnounceWinners[freezeR];
     let chosen = 0, src = 'none';
     if (wEnd != null) { chosen = wEnd; src = 'end'; }
-    else if (wAnn != null) { chosen = wAnn; src = 'announce'; }
     else if (wKill != null) { chosen = wKill; src = 'lastkill'; }
+    else if (wAnn != null) { chosen = wAnn; src = 'announce'; }
     computedWinners[freezeR] = chosen;
     winnerSources[freezeR] = src;
-    // Detecter divergences entre sources (utile pour identifier les rounds
-    // ou announce_win ment).
+    // Detecter divergences entre sources (indicatif pour le debug).
     const present = [wEnd, wAnn, wKill].filter(w => w != null);
     if (present.length >= 2 && new Set(present).size > 1) divergeCount++;
   });
-  const srcCounts = { end: 0, announce: 0, lastkill: 0, none: 0 };
+  const srcCounts = { end: 0, lastkill: 0, announce: 0, none: 0 };
   Object.values(winnerSources).forEach(s => srcCounts[s]++);
-  console.log(`Winners merged: ${roundNums.length} rounds, sources end=${srcCounts.end} announce=${srcCounts.announce} lastkill=${srcCounts.lastkill} none=${srcCounts.none}, divergences=${divergeCount}`);
+  console.log(`Winners merged: ${roundNums.length} rounds, sources end=${srcCounts.end} lastkill=${srcCounts.lastkill} announce=${srcCounts.announce} none=${srcCounts.none}, divergences=${divergeCount}`);
 
   let displayCounter = 0;
   const rounds = roundNums.map((freezeR, i) => {
