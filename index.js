@@ -53,7 +53,7 @@ const upload = multer({
 app.get('/', (req, res) => {
   let fzstdOk = false;
   try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.8.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true, roundEndShift: true, winPanelSource: true, rawEventDump: true });
+  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.9.0', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true, roundEndShift: true, winPanelSource: true, rawEventDump: true, roundEndLastWins: true });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -226,19 +226,26 @@ async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
     return null;
   }
 
+  // Dedup LAST-WINS sur trp : sur les matches a fin rapide (16 rounds),
+  // round_end peut emettre un event PHANTOM tres tot (tick < premier
+  // freeze_end reel) avec winner different. Ex Anubis 16r : trp=1 @ tick=3389
+  // winner=T (phantom), puis trp=1 @ tick=13433 winner=CT (reel). Garder le
+  // FIRST nous fait perdre 1 round pour l equipe gagnante et la bascule
+  // en off-by-1 (13:3 devient 12:4). On trie par tick croissant puis on
+  // overwrite systematiquement → le dernier event pour un trp donne (=
+  // le plus tardif = le reel) gagne.
   const roundEndWinners = {};
   let roundEndRaw = [];
   try {
     roundEndRaw = parseEvent(demoPath, 'round_end', [], ['winner', 'reason', 'total_rounds_played', 'tick']);
-    roundEndRaw.forEach(e => {
-      // SHIFT -1 : total_rounds_played ici est 1-based. Le round 1 correspond
-      // a freezeR=0, etc. On skippe les events ou total_rounds_played < 1
-      // (warmup, pre-match) qui donneraient un freezeR negatif.
+    const sortedRoundEnd = [...roundEndRaw].sort((a, b) => (a.tick ?? 0) - (b.tick ?? 0));
+    sortedRoundEnd.forEach(e => {
       const raw = e.total_rounds_played;
       if (raw == null || raw < 1) return;
       const freezeR = raw - 1;
       const w = normalizeWinner(e.winner);
-      if (w != null && roundEndWinners[freezeR] === undefined) {
+      if (w != null) {
+        // overwrite : last-wins par tick croissant
         roundEndWinners[freezeR] = w;
       }
     });
