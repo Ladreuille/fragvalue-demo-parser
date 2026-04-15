@@ -1,0 +1,14 @@
+# nixpacks.toml
+# On a besoin du binaire natif `zstd` dans le container Railway pour
+# decompresser les demos CS2 servies par FACEIT. Historiquement on utilisait
+# fzstd (pure JS, pas de dep systeme) mais depuis que FACEIT est passe sur
+# un CDN S3 Backblaze avec des fichiers >300 MB, fzstd throw
+# "invalid zstd data" de maniere inconstistente — probablement un souci
+# memoire ou un frame multi-zstd qu'il ne gere pas. Le binaire natif zstd
+# handle tout ca nickel en streaming et c'est l'implem de reference de
+# Facebook, donc zero doute sur la robustesse.
+#
+# Le '...' sentinel fait pass-through sur les pkgs auto-detectes par
+# Nixpacks (nodejs, npm) pour qu'on ajoute zstd en plus sans casser l'auto.
+[phases.setup]
+nixPkgs = ['...', 'zstd']

@@ -51,9 +51,27 @@ const upload = multer({
 });
 
 app.get('/', (req, res) => {
-  let fzstdOk = false;
-  try { require('fzstd'); fzstdOk = true; } catch (_) {}
-  res.json({ status: 'ok', service: 'FragValue Demo Parser CS2', version: '6.9.1', fzstd: fzstdOk, overrideDemoUrl: true, multiSourceWinner: true, roundEndShift: true, winPanelSource: true, rawEventDump: true, roundEndLastWins: true });
+  // Probe de disponibilite du binaire natif zstd (installe via nixpacks.toml).
+  // Pas de fallback : si le binaire manque le parse zstd failed de toute
+  // facon. On surface juste l'info pour detecter une regression d'image
+  // Railway depuis cette page de health check.
+  let nativeZstdOk = false;
+  try {
+    require('child_process').execFileSync('zstd', ['--version'], { stdio: 'ignore' });
+    nativeZstdOk = true;
+  } catch (_) {}
+  res.json({
+    status: 'ok',
+    service: 'FragValue Demo Parser CS2',
+    version: '6.9.2',
+    nativeZstd: nativeZstdOk,
+    overrideDemoUrl: true,
+    multiSourceWinner: true,
+    roundEndShift: true,
+    winPanelSource: true,
+    rawEventDump: true,
+    roundEndLastWins: true,
+  });
 });
 app.get('/ping', (req, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.json({ ok: true, ts: Date.now() }); });
 
@@ -1063,12 +1081,30 @@ async function downloadAndParse(matchId, demoUrl) {
         inp.on('error', reject);
       });
     } else if (isZstd) {
-      // fzstd: pure JS, pas de binding natif — lit le fichier en memoire puis
-      // ecrit le buffer decompresse. Taille typique ~50-120MB, OK pour Railway.
-      const fzstd = require('fzstd');
-      const compressed = fs.readFileSync(downloadPath);
-      const decompressed = fzstd.decompress(compressed);
-      fs.writeFileSync(decompressedPath, Buffer.from(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength));
+      // Decompression via le binaire natif zstd (installe via nixpacks.toml).
+      //
+      // HISTORIQUE : on utilisait fzstd (pure JS) avant v6.9.2 mais depuis
+      // que FACEIT est passe sur leur CDN S3 Backblaze, les demos servies
+      // font >300 MB compressees et fzstd throw "invalid zstd data" de
+      // maniere non-deterministe. Probablement un souci memoire (fzstd
+      // charge tout le compressed + decompressed en heap JS, ~1 GB pour
+      // une demo) ou un frame structure qu'il ne gere pas.
+      //
+      // Le binaire natif streame l'input vers l'output sans jamais tout
+      // charger en RAM, supporte tous les flavours de zstd et reste la
+      // reference. On le call via child_process en mode fichier -> fichier.
+      const { spawn } = require('child_process');
+      await new Promise((resolve, reject) => {
+        // -d decompress, -f force overwrite, -q quiet, -o output, input
+        const proc = spawn('zstd', ['-d', '-f', '-q', '-o', decompressedPath, downloadPath]);
+        let stderr = '';
+        proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+        proc.on('error', reject); // ENOENT si zstd pas installe
+        proc.on('close', code => {
+          if (code === 0) resolve();
+          else reject(new Error(`zstd exit ${code}: ${stderr.trim() || 'unknown error'}`));
+        });
+      });
     } else if (isDem) {
       // Deja un .dem non compresse — on renomme
       fs.copyFileSync(downloadPath, decompressedPath);
@@ -1437,5 +1473,5 @@ app.post('/process-match', async (req, res) => {
 const server = app.listen(PORT, () => {
   server.keepAliveTimeout = 620000;
   server.headersTimeout   = 630000;
-  console.log(`FragValue Demo Parser CS2 v6.3 on port ${PORT}`);
+  console.log(`FragValue Demo Parser CS2 v6.9.2 on port ${PORT}`);
 });
