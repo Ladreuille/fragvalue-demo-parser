@@ -1009,12 +1009,105 @@ function faceitFetch(endpoint) {
   });
 }
 
-// Recupere le demo_url du match via l'API FACEIT
+// Exchange a dead-CDN resource URL for a presigned download URL.
+// Server-side call — NOT subject to Cloudflare's browser JS challenge.
+// Tries multiple FACEIT API hosts because they may have different WAF rules.
+function exchangeDemoUrl(resourceUrl) {
+  const HOSTS = [
+    'https://open.faceit.com/download/v2/demos/download-url',
+    'https://api.faceit.com/download/v2/demos/download-url',
+    'https://www.faceit.com/api/download/v2/demos/download-url',
+  ];
+
+  function tryHost(apiUrl) {
+    return new Promise((resolve, reject) => {
+      const postData = JSON.stringify({ resource_url: resourceUrl });
+      const parsed = new URL(apiUrl);
+      const req = https.request({
+        hostname: parsed.hostname,
+        path: parsed.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${FACEIT_API_KEY}`,
+          'Content-Length': Buffer.byteLength(postData),
+        },
+        timeout: 15000,
+      }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`${parsed.hostname} ${res.statusCode}: ${data.slice(0, 120)}`));
+            return;
+          }
+          try {
+            const json = JSON.parse(data);
+            const url = json?.payload?.download_url || json?.download_url;
+            if (url) resolve(url);
+            else reject(new Error(`${parsed.hostname}: no download_url in response`));
+          } catch (e) {
+            reject(new Error(`${parsed.hostname}: invalid JSON`));
+          }
+        });
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error(`${parsed.hostname}: timeout`)); });
+      req.write(postData);
+      req.end();
+    });
+  }
+
+  // Try each host in order, stop at first success
+  return (async () => {
+    for (const host of HOSTS) {
+      try {
+        const url = await tryHost(host);
+        console.log(`[faceit] exchanged via ${new URL(host).hostname}`);
+        return url;
+      } catch (err) {
+        console.warn(`[faceit] exchange ${err.message}`);
+      }
+    }
+    return null;
+  })();
+}
+
+// Rewrite dead FACEIT CDN hostnames to the live Backblaze B2 S3 endpoint.
+// demos-europe-central.backblaze.faceit-cdn.net (DNS dead since 2024)
+// → demos-europe-central-faceit-cdn.s3.eu-central-003.backblazeb2.com
+// Used as last-resort fallback if the exchange endpoint is unreachable.
+function rewriteCdnUrl(url) {
+  if (!url) return url;
+  try {
+    const u = new URL(url);
+    const m = u.hostname.match(/^(demos-[^.]+)\.backblaze\.faceit-cdn\.net$/);
+    if (!m) return url;
+    u.hostname = m[1] + '-faceit-cdn.s3.eu-central-003.backblazeb2.com';
+    return u.toString();
+  } catch (_) { return url; }
+}
+
+// Recupere le demo_url du match via l'API FACEIT, puis tente d'echanger
+// l'URL morte contre une URL presignee via le download endpoint server-side.
 async function getFaceitDemoUrl(matchId) {
   try {
     const match = await faceitFetch(`/matches/${matchId}`);
     const urls = match?.demo_url || match?.demo_urls || [];
-    const demoUrl = Array.isArray(urls) ? urls[0] : urls;
+    let demoUrl = Array.isArray(urls) ? urls[0] : urls;
+    if (!demoUrl) return { demoUrl: null, match };
+
+    // Try server-side exchange for a presigned URL (no Cloudflare JS challenge)
+    const presigned = await exchangeDemoUrl(demoUrl);
+    if (presigned) {
+      console.log(`[faceit] ${matchId} got presigned URL`);
+      return { demoUrl: presigned, match };
+    }
+
+    // Fallback: rewrite to B2 direct (will 401 if bucket is private)
+    console.warn(`[faceit] ${matchId} exchange failed, trying CDN rewrite`);
+    demoUrl = rewriteCdnUrl(demoUrl);
     return { demoUrl, match };
   } catch (err) {
     console.warn(`[faceit] ${matchId} demo_url error:`, err.message);
