@@ -1011,44 +1011,55 @@ function faceitFetch(endpoint) {
 
 // Exchange a dead-CDN resource URL for a presigned download URL.
 // Server-side call — NOT subject to Cloudflare's browser JS challenge.
-// Tries multiple FACEIT API hosts because they may have different WAF rules.
+// Tries multiple FACEIT API hosts + auth combos because they have
+// different WAF / auth rules.
 function exchangeDemoUrl(resourceUrl) {
-  const HOSTS = [
-    'https://open.faceit.com/download/v2/demos/download-url',
-    'https://api.faceit.com/download/v2/demos/download-url',
-    'https://www.faceit.com/api/download/v2/demos/download-url',
+  // Each entry: [url, authHeader or null]
+  // open.faceit.com only serves /data/v4, NOT /download — skip it.
+  // Try api.faceit.com first (internal API, least WAF), then www proxy.
+  // For each host we try WITH auth (API key) then WITHOUT (the endpoint
+  // may allow unauthenticated requests from server IPs).
+  const ATTEMPTS = [
+    ['https://api.faceit.com/download/v2/demos/download-url',            `Bearer ${FACEIT_API_KEY}`],
+    ['https://api.faceit.com/download/v2/demos/download-url',            null],
+    ['https://www.faceit.com/api/download/v2/demos/download-url',        `Bearer ${FACEIT_API_KEY}`],
+    ['https://www.faceit.com/api/download/v2/demos/download-url',        null],
   ];
 
-  function tryHost(apiUrl) {
+  function tryOnce(apiUrl, auth) {
     return new Promise((resolve, reject) => {
       const postData = JSON.stringify({ resource_url: resourceUrl });
       const parsed = new URL(apiUrl);
+      const headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'FragValueParser/6.9.2',
+        'Content-Length': Buffer.byteLength(postData),
+      };
+      if (auth) headers['Authorization'] = auth;
+
       const req = https.request({
         hostname: parsed.hostname,
         path: parsed.pathname,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Authorization': `Bearer ${FACEIT_API_KEY}`,
-          'Content-Length': Buffer.byteLength(postData),
-        },
+        headers,
         timeout: 15000,
       }, (res) => {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
+          const tag = `${parsed.hostname}${auth ? '+auth' : ''}`;
           if (res.statusCode !== 200) {
-            reject(new Error(`${parsed.hostname} ${res.statusCode}: ${data.slice(0, 120)}`));
+            reject(new Error(`${tag} ${res.statusCode}: ${data.slice(0, 150)}`));
             return;
           }
           try {
             const json = JSON.parse(data);
             const url = json?.payload?.download_url || json?.download_url;
             if (url) resolve(url);
-            else reject(new Error(`${parsed.hostname}: no download_url in response`));
+            else reject(new Error(`${tag}: no download_url in response`));
           } catch (e) {
-            reject(new Error(`${parsed.hostname}: invalid JSON`));
+            reject(new Error(`${tag}: invalid JSON — ${data.slice(0, 80)}`));
           }
         });
       });
@@ -1059,13 +1070,14 @@ function exchangeDemoUrl(resourceUrl) {
     });
   }
 
-  // Try each host in order, stop at first success
+  // Try each attempt in order, stop at first success
   return (async () => {
-    for (const host of HOSTS) {
+    for (const [url, auth] of ATTEMPTS) {
       try {
-        const url = await tryHost(host);
-        console.log(`[faceit] exchanged via ${new URL(host).hostname}`);
-        return url;
+        const presigned = await tryOnce(url, auth);
+        const host = new URL(url).hostname;
+        console.log(`[faceit] exchanged via ${host}${auth ? ' (auth)' : ' (no-auth)'}`);
+        return presigned;
       } catch (err) {
         console.warn(`[faceit] exchange ${err.message}`);
       }
@@ -1105,9 +1117,11 @@ async function getFaceitDemoUrl(matchId) {
       return { demoUrl: presigned, match };
     }
 
-    // Fallback: rewrite to B2 direct (will 401 if bucket is private)
-    console.warn(`[faceit] ${matchId} exchange failed, trying CDN rewrite`);
+    // Fallback: rewrite to B2 direct (will 401 if bucket is private,
+    // but worth trying in case the bucket policy changed).
+    console.warn(`[faceit] ${matchId} all exchange attempts failed, trying B2 direct`);
     demoUrl = rewriteCdnUrl(demoUrl);
+    console.log(`[faceit] ${matchId} B2 fallback URL: ${demoUrl}`);
     return { demoUrl, match };
   } catch (err) {
     console.warn(`[faceit] ${matchId} demo_url error:`, err.message);
