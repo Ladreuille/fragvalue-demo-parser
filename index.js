@@ -27,6 +27,8 @@ const PORT = process.env.PORT || 3001;
 
 app.use(cors({
   origin: [
+    'https://fragvalue.com',
+    'https://www.fragvalue.com',
     'https://frag-value.vercel.app',
     'https://frag-value-git-main-ladreuilles-projects.vercel.app',
     /\.vercel\.app$/,
