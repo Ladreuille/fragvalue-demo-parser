@@ -90,8 +90,21 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
     const result = await parseCS2Demo(demoPath, targetPlayer, req.file.originalname || '');
     res.json({ success: true, data: result });
   } catch (err) {
-    console.error('Parse error:', err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+    const msg = err && err.message ? String(err.message) : '';
+    console.error('Parse error:', msg);
+    if (!res.headersSent) {
+      // Erreur connue : entite absente du stream demo (disconnect mid-game,
+      // format CS2 recent non supporte par la lib, demo tronquee).
+      if (/EntityNotFound/i.test(msg) || (err && err.name === 'EntityNotFound')) {
+        res.status(422).json({
+          error: 'demo_unparseable',
+          message: "Cette demo a ete enregistree pendant un disconnect ou contient un format CS2 recent que notre parser ne gere pas encore. Essaie une autre demo, ou envoie-la a contact@fragvalue.com pour qu'on la regarde.",
+          technical: 'EntityNotFound'
+        });
+      } else {
+        res.status(500).json({ error: msg || 'parse_failed' });
+      }
+    }
   } finally {
     fs.unlink(demoPath, () => {});
   }
