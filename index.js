@@ -112,6 +112,101 @@ app.post('/parse', upload.single('demo'), async (req, res) => {
   }
 });
 
+// POST /parse-from-storage  ── upload direct-to-Supabase + parse server-side
+//
+// Workflow :
+//   1. Le browser uploade le .dem directement vers Supabase Storage
+//      (bucket "demos-incoming", path "{user_id}/{uuid}.dem"). Pas de
+//      proxy entre client et storage, donc pas de timeout edge Railway.
+//   2. Le browser POST ici avec { bucket, path, options, player } (JSON tiny).
+//   3. On valide le JWT du user, on download le .dem depuis Supabase via
+//      le client service_role, on parse, on nettoie (local + storage).
+//
+// Permet d'analyser des demos > 200 MB sans se faire couper a 5 min par
+// Railway sur la requete d'upload (le proxy ne voit qu'un POST JSON < 1 KB).
+app.post('/parse-from-storage', async (req, res) => {
+  if (!supabaseAdmin) {
+    return res.status(500).json({ error: 'Supabase admin non configure cote serveur' });
+  }
+
+  const { bucket, path: storagePath, player } = req.body || {};
+  if (!bucket || !storagePath) {
+    return res.status(400).json({ error: 'bucket et path requis dans le body JSON' });
+  }
+  if (bucket !== 'demos-incoming') {
+    return res.status(400).json({ error: 'bucket non autorise' });
+  }
+
+  // Auth : extrait le JWT du header Authorization et resoud l'user.
+  const authHeader = req.headers.authorization || '';
+  const jwt = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (!jwt) return res.status(401).json({ error: 'Authorization Bearer token requis' });
+
+  const { data: userData, error: authError } = await supabaseAdmin.auth.getUser(jwt);
+  if (authError || !userData?.user) {
+    return res.status(401).json({ error: 'JWT invalide ou expire' });
+  }
+  const userId = userData.user.id;
+
+  // Ownership check : path doit commencer par l'uid (defense en profondeur,
+  // la RLS du bucket le fait deja cote Supabase a l'upload).
+  if (storagePath.split('/')[0] !== userId) {
+    return res.status(403).json({ error: 'Path n appartient pas a cet user' });
+  }
+
+  console.log(`[parse-from-storage] User ${userId} -> download ${storagePath}`);
+  const { data: blob, error: dlError } = await supabaseAdmin.storage
+    .from(bucket)
+    .download(storagePath);
+
+  if (dlError || !blob) {
+    console.error('[parse-from-storage] download failed:', dlError);
+    return res.status(404).json({
+      error: 'Fichier introuvable dans le storage',
+      details: dlError?.message
+    });
+  }
+
+  // demoparser2 a besoin d'un path disque, donc on dump le blob dans /tmp.
+  const tmpPath = path.join(os.tmpdir(), `${crypto.randomUUID()}.dem`);
+  const buf = Buffer.from(await blob.arrayBuffer());
+  fs.writeFileSync(tmpPath, buf);
+  const sizeMB = (buf.length / 1024 / 1024).toFixed(1);
+  console.log(`[parse-from-storage] Downloaded ${sizeMB} MB to ${tmpPath}`);
+
+  // Timeout interne (meme valeur que /parse classique).
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
+  try {
+    const originalName = storagePath.split('/').pop() || 'demo.dem';
+    const result = await parseCS2Demo(tmpPath, player || null, originalName);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    const msg = err && err.message ? String(err.message) : '';
+    console.error('[parse-from-storage] parse error:', msg);
+    if (!res.headersSent) {
+      if (/EntityNotFound/i.test(msg) || (err && err.name === 'EntityNotFound')) {
+        res.status(422).json({
+          error: 'demo_unparseable',
+          message: "Cette demo a ete enregistree pendant un disconnect ou contient un format CS2 recent que notre parser ne gere pas encore. Essaie une autre demo, ou envoie-la a contact@fragvalue.com pour qu'on la regarde.",
+          technical: 'EntityNotFound'
+        });
+      } else {
+        res.status(500).json({ error: msg || 'parse_failed' });
+      }
+    }
+  } finally {
+    fs.unlink(tmpPath, () => {});
+    // Cleanup storage best-effort : si ca echoue le cron quotidien d'orphelins
+    // s'en chargera. On ne bloque pas la reponse au client.
+    supabaseAdmin.storage.from(bucket).remove([storagePath])
+      .then(({ error }) => {
+        if (error) console.warn('[parse-from-storage] cleanup remove failed:', error.message);
+      });
+  }
+});
+
 async function parseCS2Demo(demoPath, targetPlayer, originalName = '') {
 
   // ── 1. Infos joueurs ─────────────────────────────────────────────────────
